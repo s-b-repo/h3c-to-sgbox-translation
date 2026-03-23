@@ -1,0 +1,46 @@
+[Unit]
+Description=H3C to SGBox Secure Log Translator (v2.0 — async)
+Documentation=https://github.com/your-org/h3c-sgbox-translator
+After=network.target syslog.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=h3c-translator
+Group=h3c-translator
+WorkingDirectory=/opt/h3c-sgbox-translator
+ExecStart=/opt/h3c-sgbox-translator/venv/bin/python3 -m src.translator --config /etc/h3c-translator/translator.config
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/log/h3c-translator /var/run
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+MemoryDenyWriteExecute=true
+LockPersonality=true
+
+# Restart policy
+Restart=always
+RestartSec=10
+StartLimitBurst=5
+StartLimitIntervalSec=60
+
+# Resource limits
+LimitNOFILE=65535
+LimitNPROC=4096
+
+# Logging (structlog → journald)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=h3c-translator
+
+[Install]
+WantedBy=multi-user.target

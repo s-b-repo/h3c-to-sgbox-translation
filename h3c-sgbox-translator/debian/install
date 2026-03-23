@@ -1,0 +1,2 @@
+translator.config etc/h3c-translator/
+systemd/h3c-translator.service lib/systemd/system/

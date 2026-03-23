@@ -1,0 +1,14 @@
+h3c-sgbox-translator (2.0.0-1) trixie; urgency=medium
+
+  * Major release: async rewrite with 3rd-party dependencies
+  * Replaced stdlib http.server with aiohttp async web framework
+  * Added uvloop for high-performance event loop
+  * Added structlog for structured JSON logging
+  * Added tenacity for retry logic with exponential backoff
+  * Added pyOpenSSL for enhanced TLS certificate handling
+  * Made syslog forwarder fully async (asyncio streams)
+  * Made API server fully async (aiohttp middlewares)
+  * Requires Python >= 3.11 (Debian 13 Trixie default)
+  * Removed all Python 3.6 compatibility code
+
+ -- H3C Translator Team <admin@example.com>  Sun, 23 Mar 2026 11:30:00 +0200

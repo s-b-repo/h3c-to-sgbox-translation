@@ -29,7 +29,9 @@ apt-get install -y -qq \
     python3-aiohttp \
     python3-uvloop \
     python3-openssl \
-    openssl
+    openssl \
+    curl \
+    ca-certificates
 
 # ── Create service user ───────────────────────────────────────────
 if ! id -u h3c-translator &>/dev/null; then
@@ -62,9 +64,59 @@ else
     echo "[*] Config already exists, skipping (${CONFIG_DIR}/translator.config)"
 fi
 
-# ── Generate self-signed TLS certs if missing ──────────────────────
+# ── Fetch trusted CA bundle for outbound TLS to SGBox ──────────────
+echo "[*] Fetching Google Trust Services root CAs..."
+GOOGLE_ROOTS="${CERT_DIR}/google-roots.pem"
+CA_BUNDLE="${CERT_DIR}/ca-bundle.pem"
+
+if curl -sSL --retry 3 --retry-delay 2 --max-time 30 \
+    "https://pki.goog/roots.pem" \
+    -o "${GOOGLE_ROOTS}" 2>/dev/null; then
+    # Validate the downloaded file is actually PEM
+    if grep -q "BEGIN CERTIFICATE" "${GOOGLE_ROOTS}" 2>/dev/null; then
+        echo "    ✓ Downloaded and validated: ${GOOGLE_ROOTS}"
+    else
+        echo "    ⚠  Downloaded file is not a valid PEM certificate — discarding"
+        rm -f "${GOOGLE_ROOTS}"
+    fi
+else
+    echo "    ⚠  Failed to download Google roots (network error)"
+    echo "       The installer will use system CAs only"
+    rm -f "${GOOGLE_ROOTS}"
+fi
+
+echo "[*] Building merged CA bundle (Google roots + system CAs)..."
+: > "${CA_BUNDLE}"
+
+# Add Google roots if download succeeded
+if [ -f "${GOOGLE_ROOTS}" ] && [ -s "${GOOGLE_ROOTS}" ]; then
+    cat "${GOOGLE_ROOTS}" >> "${CA_BUNDLE}"
+fi
+
+# Append system CA bundle
+if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+    cat /etc/ssl/certs/ca-certificates.crt >> "${CA_BUNDLE}"
+elif [ -f /etc/pki/tls/certs/ca-bundle.crt ]; then
+    cat /etc/pki/tls/certs/ca-bundle.crt >> "${CA_BUNDLE}"
+else
+    echo "    ⚠  No system CA bundle found at /etc/ssl/certs/ca-certificates.crt"
+    echo "       Install the ca-certificates package: apt install ca-certificates"
+fi
+
+# Verify the final bundle is non-empty and valid
+if [ -s "${CA_BUNDLE}" ] && grep -q "BEGIN CERTIFICATE" "${CA_BUNDLE}" 2>/dev/null; then
+    CERT_COUNT=$(grep -c "BEGIN CERTIFICATE" "${CA_BUNDLE}")
+    echo "    ✓ CA bundle created: ${CA_BUNDLE} (${CERT_COUNT} certificates)"
+else
+    echo "    ✗ ERROR: CA bundle is empty or invalid!"
+    echo "       TLS verification to SGBox will fail."
+    echo "       Manually fix: curl -sSL https://pki.goog/roots.pem > ${CA_BUNDLE}"
+    # Don't exit — the service can still start, it just won't verify certs
+fi
+
+# ── Generate self-signed TLS cert for inbound listener (H3C → translator) ──
 if [ ! -f "${CERT_DIR}/server.crt" ]; then
-    echo "[*] Generating self-signed TLS certificate..."
+    echo "[*] Generating self-signed TLS certificate (inbound listener)..."
     openssl req -x509 -newkey rsa:4096 -nodes \
         -keyout "${CERT_DIR}/server.key" \
         -out "${CERT_DIR}/server.crt" \

@@ -103,7 +103,7 @@ def setup_structlog(config: dict):
     ))
     root.addHandler(console)
 
-    # File handler (if configured)
+    # File handler (if configured) — bridge structlog events into stdlib
     if log_file:
         log_dir = os.path.dirname(log_file)
         if log_dir and not os.path.exists(log_dir):
@@ -112,15 +112,21 @@ def setup_structlog(config: dict):
         max_bytes = int(log_config.get("max_size_mb", 100)) * 1024 * 1024
         backup_count = int(log_config.get("backup_count", 5))
 
+        # Use structlog's ProcessorFormatter so structlog-generated events
+        # are rendered properly before being written to the log file.
+        file_formatter = structlog.stdlib.ProcessorFormatter(
+            processors=[
+                structlog.stdlib.ProcessorFormatter.remove_processors_meta,
+                structlog.processors.JSONRenderer(),
+            ],
+        )
+
         file_handler = logging.handlers.RotatingFileHandler(
             log_file,
             maxBytes=max_bytes,
             backupCount=backup_count,
         )
-        file_handler.setFormatter(logging.Formatter(
-            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        ))
+        file_handler.setFormatter(file_formatter)
         root.addHandler(file_handler)
 
 
@@ -167,17 +173,15 @@ def daemonize(pid_file: str):
         logger.error("daemon.second_fork_failed", error=str(e))
         sys.exit(1)
 
-    # Redirect stdio
+    # Redirect stdio using raw FDs — avoids fragile close-after-dup2
     sys.stdout.flush()
     sys.stderr.flush()
 
-    devnull_r = open(os.devnull, "r")
-    devnull_w = open(os.devnull, "w")
-    os.dup2(devnull_r.fileno(), sys.stdin.fileno())
-    os.dup2(devnull_w.fileno(), sys.stdout.fileno())
-    os.dup2(devnull_w.fileno(), sys.stderr.fileno())
-    devnull_r.close()
-    devnull_w.close()
+    devnull_fd = os.open(os.devnull, os.O_RDWR)
+    os.dup2(devnull_fd, sys.stdin.fileno())
+    os.dup2(devnull_fd, sys.stdout.fileno())
+    os.dup2(devnull_fd, sys.stderr.fileno())
+    os.close(devnull_fd)
 
     # Write PID file
     pid = os.getpid()

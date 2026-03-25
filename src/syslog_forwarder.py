@@ -12,6 +12,7 @@ Dependencies: structlog, tenacity
 """
 
 import asyncio
+import os
 import ssl
 
 import structlog
@@ -93,14 +94,19 @@ class SyslogForwarder:
     async def _connect_tcp(self):
         """Async TCP/TLS connection with tenacity retry."""
         ssl_ctx = None
+        server_hostname = None
         if self.protocol == "tls":
             ssl_ctx = self._create_ssl_context()
+            # server_hostname is required for SNI and hostname verification.
+            # Pass self.host so it works with both IPs and domain names.
+            server_hostname = self.host
 
         self._reader, self._writer = await asyncio.wait_for(
             asyncio.open_connection(
                 host=self.host,
                 port=self.port,
                 ssl=ssl_ctx,
+                server_hostname=server_hostname,
             ),
             timeout=10.0,
         )
@@ -179,9 +185,26 @@ class SyslogForwarder:
 
         ca_file = self._tls_config.get("ca_file", "")
         if ca_file:
-            ctx.load_verify_locations(cafile=ca_file)
+            if not os.path.isfile(ca_file):
+                logger.error("forwarder.ca_file_not_found",
+                             ca_file=ca_file,
+                             hint="Re-run install.sh to fetch the CA bundle")
+                raise FileNotFoundError(
+                    f"CA bundle not found: {ca_file}. "
+                    f"Re-run install.sh or manually fetch: "
+                    f"curl -sSL https://pki.goog/roots.pem > {ca_file}"
+                )
+            try:
+                ctx.load_verify_locations(cafile=ca_file)
+                logger.debug("forwarder.ca_loaded", ca_file=ca_file)
+            except ssl.SSLError as e:
+                logger.error("forwarder.ca_load_failed",
+                             ca_file=ca_file, error=str(e),
+                             hint="CA bundle may be corrupted. Re-run install.sh")
+                raise
         else:
             ctx.set_default_verify_paths()
+            logger.debug("forwarder.using_system_cas")
 
         return ctx
 

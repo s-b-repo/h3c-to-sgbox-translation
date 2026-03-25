@@ -108,12 +108,16 @@ class SyslogOutputServer:
             async with self._clients_lock:
                 self._clients.pop(client_id, None)
             self._stats["collectors_connected"] -= 1
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except Exception:
-                pass
+            await self._safe_close_writer(writer)
             logger.info("output.collector_disconnected", client_id=client_id)
+
+    async def _safe_close_writer(self, writer: asyncio.StreamWriter):
+        """Safely close an async writer, catching ConnectionResetError."""
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except (ConnectionResetError, OSError, Exception):
+            pass
 
     async def send(self, message: str):
         """

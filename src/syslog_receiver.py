@@ -19,6 +19,9 @@ from typing import Callable, Dict, List, Optional, Set
 
 logger = structlog.get_logger(__name__)
 
+# Maximum syslog message line size (bytes). Limits StreamReader buffering.
+MAX_SYSLOG_LINE = 8192  # 8 KB — RFC 5424 recommends ≤ 2048, generous margin
+
 
 class SyslogReceiver:
     """
@@ -44,6 +47,7 @@ class SyslogReceiver:
         self._active_connections: Set[str] = set()
         self._max_connections = int(config.get("server", {}).get("max_connections", 100))
         self._connection_semaphore: Optional[asyncio.Semaphore] = None
+        self._active_count: int = 0  # public counter replaces semaphore._value access
         self._allowed_networks = self._parse_allowed_ips(
             config.get("security", {}).get("allowed_ips", "0.0.0.0/0")
         )
@@ -76,6 +80,7 @@ class SyslogReceiver:
                 host=bind_address,
                 port=tls_port,
                 ssl=ssl_ctx,
+                limit=MAX_SYSLOG_LINE,
             )
             self._servers.append(tls_server)
             logger.info("receiver.tls_started", port=tls_port)
@@ -89,6 +94,7 @@ class SyslogReceiver:
                 self._handle_client,
                 host=bind_address,
                 port=tcp_port,
+                limit=MAX_SYSLOG_LINE,
             )
             self._servers.append(tcp_server)
             logger.info("receiver.tcp_started", port=tcp_port)
@@ -119,8 +125,8 @@ class SyslogReceiver:
             await writer.wait_closed()
             return
 
-        # ── Connection limit check (atomic via semaphore) ──────────
-        if not self._connection_semaphore._value:
+        # ── Connection limit check ─────────────────────────────────
+        if self._active_count >= self._max_connections:
             self._stats["connections_rejected_limit"] += 1
             logger.warning("receiver.max_connections",
                             client_ip=client_ip,
@@ -130,12 +136,12 @@ class SyslogReceiver:
             return
 
         await self._connection_semaphore.acquire()
+        self._active_count += 1
         self._stats["connections_total"] += 1
         conn_id = f"{client_ip}:{peername[1] if peername else 0}"
         self._active_connections.add(conn_id)
-        active_count = self._max_connections - self._connection_semaphore._value
         logger.info("receiver.connected",
-                      client_ip=client_ip, active=active_count)
+                      client_ip=client_ip, active=self._active_count)
 
         try:
             while True:
@@ -146,6 +152,13 @@ class SyslogReceiver:
                 except asyncio.TimeoutError:
                     logger.debug("receiver.timeout", client_ip=client_ip)
                     break
+                except asyncio.LimitOverrunError:
+                    # Line exceeds MAX_SYSLOG_LINE — drain and skip
+                    logger.warning("receiver.line_too_long",
+                                    client_ip=client_ip,
+                                    limit=MAX_SYSLOG_LINE)
+                    await reader.readline()  # consume the rest
+                    continue
 
                 if not data:
                     break  # Connection closed
@@ -169,15 +182,15 @@ class SyslogReceiver:
                           client_ip=client_ip, error=str(e))
         finally:
             self._connection_semaphore.release()
+            self._active_count -= 1
             self._active_connections.discard(conn_id)
             writer.close()
             try:
                 await writer.wait_closed()
             except Exception:
                 pass
-            active = self._max_connections - self._connection_semaphore._value
             logger.info("receiver.disconnected",
-                          client_ip=client_ip, active=active)
+                          client_ip=client_ip, active=self._active_count)
 
     def _create_ssl_context(self, tls_config: dict) -> ssl.SSLContext:
         """
@@ -230,7 +243,7 @@ class SyslogReceiver:
             return False
 
     @staticmethod
-    def _parse_allowed_ips(allowed_str: str) -> list[ipaddress.IPv4Network]:
+    def _parse_allowed_ips(allowed_str: str) -> list[ipaddress.IPv4Network | ipaddress.IPv6Network]:
         """Parse comma-separated IP/CIDR list into network objects."""
         networks = []
         for entry in allowed_str.split(","):

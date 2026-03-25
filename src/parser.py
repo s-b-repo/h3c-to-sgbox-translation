@@ -168,13 +168,7 @@ class H3CLogParser:
         event_raw = result.get("event", "")
         result["action"] = self._derive_action(event_raw)
 
-        # ── Clean up empty/placeholder values ──────────────────────
-        for key in list(result.keys()):
-            if result[key] in ("", "--", "0") and key not in (
-                "proto", "src", "dst", "sport", "dport", "action"
-            ):
-                if not key.startswith("_"):
-                    pass  # Keep mapped fields, let formatter decide
+        # Clean up: no action needed — formatter handles empty/placeholder values
 
         with self._stats_lock:
             self._stats["parsed"] += 1
@@ -204,10 +198,14 @@ class H3CLogParser:
 
         if len(parts) >= 3:
             timestamp = parts[0].strip()
+            hostname = parts[1].strip() if len(parts) > 1 else ""
             raw_data = parts[2].strip()
             result = self.parse(raw_data)
             if result:
                 result["_csv_timestamp"] = timestamp
+                # Preserve the CSV hostname if not already set by syslog header
+                if hostname and "hostname" not in result:
+                    result["hostname"] = hostname
             return result
 
         return self.parse(csv_line)

@@ -11,7 +11,7 @@ Output format:
 Dependencies: structlog
 """
 
-import threading
+import threading  # retained for backward-compat; lock guards stats in sync code
 
 import structlog
 from typing import Dict, Optional, List
@@ -104,7 +104,8 @@ class SGBoxFormatter:
 
         # Require at least proto and one of src/dst
         if "proto" not in parsed:
-            self._stats["skipped"] += 1
+            with self._stats_lock:
+                self._stats["skipped"] += 1
             logger.debug("formatter.missing_proto")
             return None
 
@@ -141,7 +142,7 @@ class SGBoxFormatter:
         timestamp = parsed.get("_csv_timestamp", "")
 
         if self.include_timestamp and timestamp:
-            return f"<{pri}>{timestamp}  {hostname} h3c-translator: {msg}"
+            return f"<{pri}>{timestamp} {hostname} h3c-translator: {msg}"
         else:
             return f"<{pri}>{hostname} h3c-translator: {msg}"
 

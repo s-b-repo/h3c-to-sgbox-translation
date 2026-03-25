@@ -23,6 +23,7 @@ Uses aiohttp — the most popular async HTTP framework for Python.
 import asyncio
 import hmac
 import ipaddress
+import json
 import ssl
 import time
 
@@ -37,23 +38,31 @@ logger = structlog.get_logger(__name__)
 # ── Constants ──────────────────────────────────────────────────────────
 MAX_BULK_LINES = 1000          # cap bulk array size
 MAX_BODY_SIZE = 10 * 1024 * 1024  # 10 MB
+MAX_SINGLE_BODY = 64 * 1024    # 64 KB for single translate
 RATE_LIMIT_WINDOW = 60         # seconds
 RATE_LIMIT_MAX_REQUESTS = 120  # per IP per window
+RATE_LIMIT_MAX_IPS = 10_000    # max tracked IPs (OOM prevention)
 
 
 class _RateLimiter:
-    """Async-safe per-IP sliding-window rate limiter."""
+    """Async-safe per-IP sliding-window rate limiter with OOM protection."""
 
     def __init__(self, window: int = RATE_LIMIT_WINDOW,
-                 max_requests: int = RATE_LIMIT_MAX_REQUESTS):
+                 max_requests: int = RATE_LIMIT_MAX_REQUESTS,
+                 max_ips: int = RATE_LIMIT_MAX_IPS):
         self._window = window
         self._max = max_requests
+        self._max_ips = max_ips
         self._lock = asyncio.Lock()
         self._hits: dict[str, list[float]] = {}
 
     async def is_allowed(self, client_ip: str) -> bool:
         now = time.monotonic()
         async with self._lock:
+            # Evict stale IPs when the table exceeds the cap
+            if len(self._hits) > self._max_ips:
+                self._evict_stale(now)
+
             timestamps = self._hits.get(client_ip, [])
             timestamps = [t for t in timestamps if now - t < self._window]
             if len(timestamps) >= self._max:
@@ -62,6 +71,15 @@ class _RateLimiter:
             timestamps.append(now)
             self._hits[client_ip] = timestamps
             return True
+
+    def _evict_stale(self, now: float):
+        """Remove IPs whose timestamps have all expired (called under lock)."""
+        stale_keys = [
+            ip for ip, ts in self._hits.items()
+            if not ts or all(now - t >= self._window for t in ts)
+        ]
+        for key in stale_keys:
+            del self._hits[key]
 
 
 class APIServer:
@@ -88,6 +106,9 @@ class APIServer:
         self._api_key: str = security_config.get("api_key", "")
         self._allowed_networks = self._parse_allowed_ips(
             security_config.get("allowed_ips", "")
+        )
+        self._trusted_proxies = self._parse_allowed_ips(
+            security_config.get("trusted_proxies", "")
         )
 
     async def start(self):
@@ -172,11 +193,33 @@ class APIServer:
 
     # ── Middlewares ─────────────────────────────────────────────────
 
+    def _get_client_ip(self, request: web.Request) -> str:
+        """Resolve the real client IP, respecting X-Forwarded-For behind trusted proxies."""
+        peer_ip = request.remote
+        if self._trusted_proxies:
+            try:
+                peer_addr = ipaddress.ip_address(peer_ip)
+                is_trusted = any(peer_addr in net for net in self._trusted_proxies)
+            except ValueError:
+                is_trusted = False
+
+            if is_trusted:
+                xff = request.headers.get("X-Forwarded-For", "")
+                if xff:
+                    # Take the rightmost untrusted IP (last entry added by the proxy)
+                    forwarded_ip = xff.split(",")[0].strip()
+                    try:
+                        ipaddress.ip_address(forwarded_ip)
+                        return forwarded_ip
+                    except ValueError:
+                        pass
+        return peer_ip
+
     @web.middleware
     async def _ip_whitelist_middleware(self, request: web.Request, handler):
         """Enforce IP whitelist on every request."""
         if self._allowed_networks:
-            client_ip = request.remote
+            client_ip = self._get_client_ip(request)
             try:
                 addr = ipaddress.ip_address(client_ip)
                 allowed = any(addr in net for net in self._allowed_networks)
@@ -197,7 +240,7 @@ class APIServer:
         if self._api_key:
             provided = request.headers.get("X-API-Key", "")
             if not provided or not hmac.compare_digest(provided, self._api_key):
-                logger.warning("api.auth_failure", client_ip=request.remote)
+                logger.warning("api.auth_failure", client_ip=self._get_client_ip(request))
                 raise web.HTTPUnauthorized(
                     text='{"error": "Unauthorized"}',
                     content_type="application/json",
@@ -207,7 +250,7 @@ class APIServer:
     @web.middleware
     async def _rate_limit_middleware(self, request: web.Request, handler):
         """Per-IP rate limiting."""
-        client_ip = request.remote
+        client_ip = self._get_client_ip(request)
         if not await self._rate_limiter.is_allowed(client_ip):
             logger.warning("api.rate_limited", client_ip=client_ip)
             raise web.HTTPTooManyRequests(
@@ -228,8 +271,8 @@ class APIServer:
         response.headers["Content-Security-Policy"] = "default-src 'none'"
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         response.headers["Pragma"] = "no-cache"
-        # CORS
-        response.headers["Access-Control-Allow-Origin"] = "null"
+        # CORS — backend-only API: do not allow any browser origin
+        # Omit Access-Control-Allow-Origin entirely to deny cross-origin access
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
         return response
@@ -260,7 +303,7 @@ class APIServer:
         try:
             body = await request.text()
         except Exception:
-            logger.error("api.read_body_failed", client_ip=request.remote)
+            logger.error("api.read_body_failed", client_ip=self._get_client_ip(request))
             raise web.HTTPBadRequest(
                 text='{"error": "Failed to read request body"}',
                 content_type="application/json",
@@ -272,8 +315,15 @@ class APIServer:
                 content_type="application/json",
             )
 
+        # Strict body size check for single translate (prevent memory abuse)
+        if len(body) > MAX_SINGLE_BODY:
+            raise web.HTTPRequestEntityTooLarge(
+                max_size=MAX_SINGLE_BODY,
+                actual_size=len(body),
+                text='{"error": "Request body too large for single translate"}',
+            )
+
         try:
-            import json
             data = json.loads(body)
             raw_line = data.get("raw", "")
         except (ValueError, AttributeError):
@@ -285,14 +335,20 @@ class APIServer:
                 content_type="application/json",
             )
 
-        parsed = self.parser.parse(raw_line)
+        # Offload CPU-bound parsing/formatting to thread pool
+        loop = asyncio.get_running_loop()
+        parsed = await loop.run_in_executor(
+            None, self.parser.parse, raw_line
+        )
         if not parsed:
             return web.json_response(
                 {"error": "Could not parse H3C log line"},
                 status=422,
             )
 
-        formatted = self.formatter.format(parsed)
+        formatted = await loop.run_in_executor(
+            None, self.formatter.format, parsed
+        )
         return web.json_response({
             "translated": formatted,
             "parsed_fields": {k: v for k, v in parsed.items()
@@ -322,6 +378,20 @@ class APIServer:
                 content_type="application/json",
             )
 
+        # Offload CPU-bound bulk translation to thread pool
+        loop = asyncio.get_running_loop()
+        results = await loop.run_in_executor(
+            None, self._translate_bulk_sync, lines
+        )
+
+        return web.json_response({
+            "count": len(results),
+            "translated": len([r for r in results if r.get("translated")]),
+            "results": results,
+        })
+
+    def _translate_bulk_sync(self, lines: list) -> list:
+        """Synchronous bulk translation (runs in executor thread)."""
         results = []
         for line in lines:
             parsed = self.parser.parse(line)
@@ -337,12 +407,7 @@ class APIServer:
                     "translated": None,
                     "error": "unparsable",
                 })
-
-        return web.json_response({
-            "count": len(results),
-            "translated": len([r for r in results if r.get("translated")]),
-            "results": results,
-        })
+        return results
 
     async def _handle_options(self, request: web.Request) -> web.Response:
         """OPTIONS — CORS pre-flight."""
@@ -350,6 +415,9 @@ class APIServer:
             status=204,
             headers={
                 "Allow": "GET, POST, HEAD, OPTIONS",
+                "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type, X-API-Key",
+                "Access-Control-Max-Age": "86400",
             },
         )
 

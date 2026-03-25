@@ -203,23 +203,31 @@ else
     echo "      Fix: curl -sSL https://pki.goog/roots.pem > ${CA_BUNDLE}"
 fi
 
-# ── Generate self-signed TLS cert for inbound listener ─────────────
+# ── Generate TLS certificates (CA + translator + SGBox) ────────────
 echo ""
-if [ ! -f "${CERT_DIR}/server.crt" ]; then
-    echo "[*] Generating self-signed TLS certificate (inbound syslog)..."
-    openssl req -x509 -newkey rsa:4096 -nodes \
-        -keyout "${CERT_DIR}/server.key" \
-        -out "${CERT_DIR}/server.crt" \
-        -days 365 \
-        -subj "/CN=h3c-translator/O=H3C-SGBox/C=ZA" \
-        -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
-        2>/dev/null
-    chmod 600 "${CERT_DIR}/server.key"
-    echo "    ✓ Certificate: ${CERT_DIR}/server.crt"
-    echo "    ✓ Private key: ${CERT_DIR}/server.key (mode 600)"
+echo "[*] Running certificate generation..."
+echo "    This is interactive — you will be prompted at each step."
+echo ""
+if [ -f "${SCRIPT_DIR}/generate_certs.sh" ]; then
+    bash "${SCRIPT_DIR}/generate_certs.sh" \
+        --cert-dir "${CERT_DIR}" \
+        --config "${CONFIG_DIR}/translator.config"
 else
-    echo "[*] TLS certificate already exists, skipping"
-    echo "    ${CERT_DIR}/server.crt"
+    echo "    ✗ generate_certs.sh not found at ${SCRIPT_DIR}"
+    echo "      Falling back to basic self-signed certificate..."
+    if [ ! -f "${CERT_DIR}/server.crt" ]; then
+        openssl req -x509 -newkey rsa:4096 -nodes \
+            -keyout "${CERT_DIR}/server.key" \
+            -out "${CERT_DIR}/server.crt" \
+            -days 365 \
+            -subj "/CN=h3c-translator/O=H3C-SGBox/C=ZA" \
+            -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+            2>/dev/null
+        chmod 600 "${CERT_DIR}/server.key"
+        echo "    ✓ Fallback cert: ${CERT_DIR}/server.crt"
+    else
+        echo "    ✓ TLS certificate already exists, skipping"
+    fi
 fi
 
 # ── Install systemd service ───────────────────────────────────────

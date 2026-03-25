@@ -184,13 +184,20 @@ class SGBoxFormatter:
     def _sanitize_value(value: str) -> str:
         """
         Sanitize a field value for safe inclusion in key=value output.
-        Replaces spaces with underscores and removes problematic characters.
+        Strips non-printable chars, ANSI escapes, and log-forging characters.
         """
-        sanitized = value.replace(" ", "_")
+        # LOW-02: Strip non-printable ASCII, null bytes, ANSI escape codes
+        import re
+        sanitized = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value)
+        # Remove ANSI escape sequences
+        sanitized = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', sanitized)
+        # Remove log-forging characters
+        sanitized = sanitized.replace(" ", "_")
         sanitized = sanitized.replace(";", "")
         sanitized = sanitized.replace("=", "")
         sanitized = sanitized.replace("\n", "")
         sanitized = sanitized.replace("\r", "")
+        sanitized = sanitized.replace("\t", "")
         return sanitized
 
     @staticmethod

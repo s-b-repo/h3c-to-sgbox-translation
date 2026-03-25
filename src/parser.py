@@ -206,8 +206,9 @@ class H3CLogParser:
             reader = csv.reader(io.StringIO(csv_line))
             parts = next(reader)
         except (StopIteration, csv.Error) as e:
-            print(f"[PARSER] CSV parse failed ({e}), trying raw parse")
-            return self.parse(csv_line)
+            print(f"[PARSER] ✗ CSV parse failed ({e}), discarding malformed line")
+            logger.warning("parser.csv_parse_failed", error=str(e))
+            return None
 
         if len(parts) >= 3:
             timestamp = parts[0].strip()

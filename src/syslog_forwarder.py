@@ -46,6 +46,16 @@ class SyslogForwarder:
         self.facility = sgbox.get("facility", "local0")
         self.severity = sgbox.get("severity", "info")
 
+        # SGBox API key for log ingestion authentication
+        self._sgbox_api_key = sgbox.get("sgbox_api_key", "").strip()
+        _INSECURE_SGBOX_KEYS = ("", "CHANGE_ME_SET_YOUR_SGBOX_API_KEY")
+        if self._sgbox_api_key in _INSECURE_SGBOX_KEYS:
+            print(f"[FORWARDER] ⚠ WARNING: sgbox_api_key is not set!")
+            print(f"[FORWARDER]   SGBox requires an API key for log ingestion on port {self.port}")
+            print(f"[FORWARDER]   Get it from SGBox: SCM → Configuration → API Keys")
+            print(f"[FORWARDER]   Set [sgbox] sgbox_api_key = <your key> in translator.config")
+            self._sgbox_api_key = ""
+
         self._tls_config = config.get("tls", {})
         self._reader: asyncio.StreamReader | None = None
         self._writer: asyncio.StreamWriter | None = None
@@ -58,12 +68,15 @@ class SyslogForwarder:
             "messages_failed": 0,
             "reconnections": 0,
         }
+        # MED-04: Lock for thread-safe stats updates
+        self._stats_lock = asyncio.Lock()
 
         print(f"[FORWARDER] Initialized")
-        print(f"[FORWARDER]   Protocol: {self.protocol.upper()}")
-        print(f"[FORWARDER]   Target:   {self.host}:{self.port}")
-        print(f"[FORWARDER]   Facility: {self.facility}")
-        print(f"[FORWARDER]   Severity: {self.severity}")
+        print(f"[FORWARDER]   Protocol:     {self.protocol.upper()}")
+        print(f"[FORWARDER]   Target:       {self.host}:{self.port}")
+        print(f"[FORWARDER]   SGBox API key: {'configured' if self._sgbox_api_key else 'NOT SET'}")
+        print(f"[FORWARDER]   Facility:     {self.facility}")
+        print(f"[FORWARDER]   Severity:     {self.severity}")
 
     @property
     def stats(self) -> dict[str, int]:
@@ -163,8 +176,14 @@ class SyslogForwarder:
             print(f"[FORWARDER] ✗ Empty message, skipping")
             return
 
-        data = (message + "\n").encode("utf-8")
-        print(f"[FORWARDER] Sending {len(data)}B via {self.protocol.upper()}: {message[:120]}...")
+        # Prepend SGBox API key if configured
+        if self._sgbox_api_key:
+            outgoing = f"APIKEY:{self._sgbox_api_key} {message}"
+        else:
+            outgoing = message
+
+        data = (outgoing + "\n").encode("utf-8")
+        print(f"[FORWARDER] Sending {len(data)}B via {self.protocol.upper()}")
 
         match self.protocol:
             case "udp":
@@ -180,10 +199,12 @@ class SyslogForwarder:
                 await self._connect_udp()
 
             self._transport.sendto(data)
-            self._stats["messages_sent"] += 1
+            async with self._stats_lock:
+                self._stats["messages_sent"] += 1
             print(f"[FORWARDER] ✓ UDP message sent ({len(data)}B)")
         except Exception as e:
-            self._stats["messages_failed"] += 1
+            async with self._stats_lock:
+                self._stats["messages_failed"] += 1
             print(f"[FORWARDER] ✗ UDP send FAILED: {e}")
             logger.error("forwarder.udp_send_failed",
                           host=self.host, port=self.port, error=str(e))
@@ -205,11 +226,13 @@ class SyslogForwarder:
             try:
                 self._writer.write(data)
                 await self._writer.drain()
-                self._stats["messages_sent"] += 1
+                async with self._stats_lock:
+                    self._stats["messages_sent"] += 1
                 print(f"[FORWARDER] ✓ {self.protocol.upper()} message sent ({len(data)}B)")
             except (BrokenPipeError, ConnectionResetError, OSError) as e:
                 self._connected = False
-                self._stats["messages_failed"] += 1
+                async with self._stats_lock:
+                    self._stats["messages_failed"] += 1
                 print(f"[FORWARDER] ✗ Connection LOST during send: {e}")
                 logger.warning("forwarder.connection_lost",
                                host=self.host, port=self.port, error=str(e))
@@ -221,9 +244,10 @@ class SyslogForwarder:
                     await self._connect_tcp()
                     self._writer.write(data)
                     await self._writer.drain()
-                    self._stats["messages_sent"] += 1
-                    self._stats["messages_failed"] -= 1
-                    self._stats["reconnections"] += 1
+                    async with self._stats_lock:
+                        self._stats["messages_sent"] += 1
+                        self._stats["messages_failed"] -= 1
+                        self._stats["reconnections"] += 1
                     print(f"[FORWARDER] ✓ Reconnected and resent successfully")
                 except Exception as e2:
                     print(f"[FORWARDER] ✗ Reconnect + resend FAILED: {e2} — message LOST")

@@ -133,7 +133,85 @@ Click **Create** and name it `H3C Translated Logs`.
 
 ---
 
-## 4. Verification ✅
+## 4. Uploading a Custom TLS Certificate to SGBox 🔐
+
+By default SGBox ships with a self-signed certificate. For production use — especially when the translator pushes logs over TLS on port 6154 — you should upload a proper certificate so the translator can verify SGBox's identity.
+
+> [!IMPORTANT]
+> Requires **SGBox version 5.3.0 or later**. Check your version under **SCM → System Info**.
+
+### 4.1 Generate Certificates (Recommended — `generate_certs.sh`)
+
+The project includes an interactive script that generates a **private CA**, a **translator certificate**, and an **SGBox certificate** — all signed by the same CA for a proper chain of trust.
+
+```bash
+# From the project directory (or /opt/h3c-sgbox-translator after install)
+sudo bash generate_certs.sh --cert-dir /etc/h3c-translator/certs \
+    --config /etc/h3c-translator/translator.config
+```
+
+The script will:
+
+1. **Generate a Private CA** — 4096-bit RSA, 10-year validity
+2. **Generate Translator cert** — signed by the CA, with SANs for localhost + machine IP
+3. **Generate SGBox cert** — signed by the CA, prompts for SGBox hostname/IP
+4. **Update the CA bundle** — appends the CA cert so the translator trusts both certs
+
+At each step, if files already exist, you will be prompted to **[O]verwrite** or **[S]kip**.
+
+> [!TIP]
+> The script also runs during `install.sh` automatically.
+
+<details>
+<summary><strong>Manual alternative (if not using the script)</strong></summary>
+
+```bash
+# Generate a self-signed cert (testing only)
+openssl req -x509 -newkey rsa:4096 -nodes \
+  -keyout sgbox.key -out sgbox.crt -days 365 \
+  -subj "/CN=sgbox.local/O=MyOrg"
+```
+
+</details>
+
+### 4.2 Upload to SGBox
+
+1. Log in to the **SGBox web console** as an administrator
+2. Navigate to **SCM → Action → Upload custom certificate**
+3. Upload the three files:
+   - **Certificate file** → select `sgbox.crt`
+   - **Private key file** → select `sgbox.key`
+   - **Chain certificate** → select `ca.crt` (the generated CA)
+4. Optionally, specify the **web server name** (FQDN) that matches the certificate's CN or SAN
+5. Click **Upload** / **Apply**
+
+> [!WARNING]
+> After uploading, SGBox restarts its web server. You will briefly lose access to the web console. Wait 30–60 seconds and reconnect.
+
+### 4.3 Verify the Connection
+
+After uploading to SGBox and restarting the translator, verify the TLS chain:
+
+```bash
+# Verify SGBox's certificate from the translator host
+openssl s_client -connect <SGBOX_IP>:6154 \
+  -CAfile /etc/h3c-translator/certs/ca-bundle.pem </dev/null
+
+# Look for: Verify return code: 0 (ok)
+```
+
+```bash
+# Check certificate details
+openssl s_client -connect <SGBOX_IP>:6154 -showcerts </dev/null 2>/dev/null \
+  | openssl x509 -noout -subject -issuer -dates
+```
+
+> [!NOTE]
+> If you used `generate_certs.sh`, the CA is already in the bundle — no manual trust configuration needed.
+
+---
+
+## 5. Verification ✅
 
 ### Check Translator Health
 ```bash

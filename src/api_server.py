@@ -106,7 +106,20 @@ class APIServer:
 
         # Parse security config once
         security_config = config.get("security", {})
-        self._api_key: str = security_config.get("api_key", "")
+        raw_api_key: str = security_config.get("api_key", "")
+
+        # CRIT-01: Block startup on default/empty API key
+        _INSECURE_KEYS = ("", "CHANGE_ME_GENERATE_A_SECURE_KEY", "changeme", "test")
+        if raw_api_key in _INSECURE_KEYS:
+            print(f"[API] ✗ FATAL: API key is not configured or uses a default placeholder!")
+            print(f"[API]   Generate one with: python3 -c \"import secrets; print(secrets.token_urlsafe(32))\"")
+            print(f"[API]   Then set [security] api_key = <your key> in translator.config")
+            raise RuntimeError(
+                "Insecure API key detected. Set a strong [security] api_key in config. "
+                "Generate with: python3 -c \"import secrets; print(secrets.token_urlsafe(32))\""
+            )
+        self._api_key: str = raw_api_key
+
         self._allowed_networks = self._parse_allowed_ips(
             security_config.get("allowed_ips", "")
         )
@@ -115,7 +128,7 @@ class APIServer:
         )
 
         print(f"[API] Initialized")
-        print(f"[API]   API key:   {'configured' if self._api_key else 'NOT SET'}")
+        print(f"[API]   API key:   configured ({len(self._api_key)} chars)")
         print(f"[API]   Whitelist: {len(self._allowed_networks) if self._allowed_networks else 'disabled'} network(s)")
 
     async def start(self):
@@ -267,20 +280,22 @@ class APIServer:
 
     @web.middleware
     async def _auth_middleware(self, request: web.Request, handler):
-        """Validate API key from X-API-Key header."""
+        """Validate API key from X-API-Key header (timing-safe)."""
         if self._api_key:
             provided = request.headers.get("X-API-Key", "")
-            match bool(provided and hmac.compare_digest(provided, self._api_key)):
-                case False:
-                    client_ip = self._get_client_ip(request)
-                    print(f"[API] ✗ AUTH FAILED from {client_ip} on {request.method} {request.path}")
-                    logger.warning("api.auth_failure", client_ip=client_ip)
-                    raise web.HTTPUnauthorized(
-                        text='{"error": "Unauthorized"}',
-                        content_type="application/json",
-                    )
-                case True:
-                    pass
+            # MED-01: Always call compare_digest to prevent timing side-channel
+            # Pad empty input to same length to avoid short-circuit leak
+            if not hmac.compare_digest(
+                provided.encode("utf-8") if provided else b"\x00",
+                self._api_key.encode("utf-8"),
+            ):
+                client_ip = self._get_client_ip(request)
+                print(f"[API] ✗ AUTH FAILED from {client_ip} on {request.method} {request.path}")
+                logger.warning("api.auth_failure", client_ip=client_ip)
+                raise web.HTTPUnauthorized(
+                    text='{"error": "Unauthorized"}',
+                    content_type="application/json",
+                )
         return await handler(request)
 
     @web.middleware
@@ -342,8 +357,29 @@ class APIServer:
         client_ip = self._get_client_ip(request)
         print(f"[API] Translate request from {client_ip}")
 
+        # MED-03: Check content-length before reading body into memory
+        content_length = request.content_length
+        if content_length is not None and content_length > MAX_SINGLE_BODY:
+            print(f"[API] ✗ Content-Length too large: {content_length} > {MAX_SINGLE_BODY}")
+            raise web.HTTPRequestEntityTooLarge(
+                max_size=MAX_SINGLE_BODY,
+                actual_size=content_length,
+                text='{"error": "Request body too large for single translate"}',
+            )
+
         try:
-            body = await request.text()
+            # Read with size limit to prevent memory exhaustion
+            raw_bytes = await request.content.read(MAX_SINGLE_BODY + 1)
+            if len(raw_bytes) > MAX_SINGLE_BODY:
+                print(f"[API] ✗ Body too large: >{MAX_SINGLE_BODY}")
+                raise web.HTTPRequestEntityTooLarge(
+                    max_size=MAX_SINGLE_BODY,
+                    actual_size=len(raw_bytes),
+                    text='{"error": "Request body too large for single translate"}',
+                )
+            body = raw_bytes.decode("utf-8", errors="replace")
+        except web.HTTPRequestEntityTooLarge:
+            raise
         except Exception as e:
             print(f"[API] ✗ Failed to read request body: {e}")
             logger.error("api.read_body_failed", client_ip=client_ip)
@@ -357,14 +393,6 @@ class APIServer:
             raise web.HTTPBadRequest(
                 text='{"error": "Empty request body"}',
                 content_type="application/json",
-            )
-
-        if len(body) > MAX_SINGLE_BODY:
-            print(f"[API] ✗ Body too large: {len(body)} > {MAX_SINGLE_BODY}")
-            raise web.HTTPRequestEntityTooLarge(
-                max_size=MAX_SINGLE_BODY,
-                actual_size=len(body),
-                text='{"error": "Request body too large for single translate"}',
             )
 
         try:

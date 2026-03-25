@@ -12,6 +12,7 @@ Dependencies: structlog
 """
 
 import asyncio
+import ipaddress
 import ssl
 
 import structlog
@@ -33,9 +34,15 @@ class SyslogOutputServer:
         self.config = config
         sgbox_cfg = config.get("sgbox", {})
         server_cfg = config.get("server", {})
+        security_cfg = config.get("security", {})
 
         self._port = int(sgbox_cfg.get("output_port", sgbox_cfg.get("port", "1514")))
         self._bind = server_cfg.get("bind_address", "0.0.0.0")
+
+        # HIGH-03: Apply same IP whitelist as receiver
+        self._allowed_networks = self._parse_allowed_ips(
+            security_cfg.get("allowed_ips", "0.0.0.0/0")
+        )
 
         # Connected SGBox collectors
         self._clients: dict[str, asyncio.StreamWriter] = {}
@@ -46,12 +53,14 @@ class SyslogOutputServer:
         self._stats = {
             "collectors_connected": 0,
             "collectors_total": 0,
+            "collectors_rejected_ip": 0,
             "messages_sent": 0,
             "messages_dropped": 0,
         }
 
         print(f"[OUTPUT] Initialized")
         print(f"[OUTPUT]   Bind: {self._bind}:{self._port}")
+        print(f"[OUTPUT]   IP whitelist: {len(self._allowed_networks) if self._allowed_networks else 'disabled'}")
 
     @property
     def stats(self) -> dict:
@@ -106,6 +115,18 @@ class SyslogOutputServer:
         peername = writer.get_extra_info("peername")
         client_ip = peername[0] if peername else "unknown"
         client_id = f"{client_ip}:{peername[1] if peername else 0}"
+
+        # HIGH-03: IP whitelist check
+        if not self._is_ip_allowed(client_ip):
+            self._stats["collectors_rejected_ip"] += 1
+            print(f"[OUTPUT] ✗ Collector REJECTED — IP {client_ip} not in whitelist")
+            logger.warning("output.collector_ip_rejected", client_ip=client_ip)
+            writer.close()
+            try:
+                await writer.wait_closed()
+            except Exception:
+                pass
+            return
 
         print(f"[OUTPUT] ✓ Collector CONNECTED: {client_id}")
         logger.info("output.collector_connected", client_id=client_id)
@@ -197,3 +218,32 @@ class SyslogOutputServer:
 
         print(f"[OUTPUT] ✓ Output server stopped. Final stats: {self._stats}")
         logger.info("output.stopped")
+
+    def _is_ip_allowed(self, client_ip: str) -> bool:
+        """Check if an IP address is in the whitelist."""
+        if not self._allowed_networks:
+            return True
+        try:
+            addr = ipaddress.ip_address(client_ip)
+            return any(addr in net for net in self._allowed_networks)
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _parse_allowed_ips(allowed_str: str) -> list:
+        """Parse comma-separated IP list into network objects."""
+        if allowed_str.strip() in ("0.0.0.0", "0.0.0.0/0"):
+            return []
+        networks = []
+        for entry in allowed_str.split(","):
+            entry = entry.strip()
+            if not entry:
+                continue
+            try:
+                if "/" in entry:
+                    networks.append(ipaddress.ip_network(entry, strict=False))
+                else:
+                    networks.append(ipaddress.ip_network(entry + "/32", strict=False))
+            except ValueError:
+                pass
+        return networks

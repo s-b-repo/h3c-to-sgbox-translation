@@ -58,6 +58,11 @@ def setup_structlog(config: dict):
     # Determine if running interactively (dev mode)
     is_dev = sys.stdout.isatty()
 
+    print(f"[LOGGING] Setting up structured logging")
+    print(f"[LOGGING]   Level: {level_name}")
+    print(f"[LOGGING]   Mode:  {'dev (console)' if is_dev else 'production (JSON)'}")
+    print(f"[LOGGING]   File:  {log_file or 'none'}")
+
     # Shared processors
     shared_processors = [
         structlog.contextvars.merge_contextvars,
@@ -67,12 +72,15 @@ def setup_structlog(config: dict):
         structlog.processors.format_exc_info,
     ]
 
-    if is_dev:
-        # Human-readable colored output for development
-        renderer = structlog.dev.ConsoleRenderer(colors=True)
-    else:
-        # JSON output for production / journald
-        renderer = structlog.processors.JSONRenderer()
+    match is_dev:
+        case True:
+            renderer = structlog.dev.ConsoleRenderer(colors=True)
+            print(f"[LOGGING] ✓ Using colored console renderer")
+        case False:
+            renderer = structlog.processors.JSONRenderer()
+            print(f"[LOGGING] ✓ Using JSON renderer")
+
+    import logging
 
     structlog.configure(
         processors=[
@@ -81,7 +89,7 @@ def setup_structlog(config: dict):
             renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(
-            structlog.processors._NAME_TO_LEVEL.get(level_name.lower(), 20)
+            getattr(logging, level_name.upper(), logging.INFO)
         ),
         context_class=dict,
         logger_factory=structlog.PrintLoggerFactory(),
@@ -103,17 +111,20 @@ def setup_structlog(config: dict):
     ))
     root.addHandler(console)
 
-    # File handler (if configured) — bridge structlog events into stdlib
+    # File handler (if configured)
     if log_file:
         log_dir = os.path.dirname(log_file)
         if log_dir and not os.path.exists(log_dir):
             os.makedirs(log_dir, exist_ok=True)
+            print(f"[LOGGING] Created log directory: {log_dir}")
 
         max_bytes = int(log_config.get("max_size_mb", 100)) * 1024 * 1024
         backup_count = int(log_config.get("backup_count", 5))
 
-        # Use structlog's ProcessorFormatter so structlog-generated events
-        # are rendered properly before being written to the log file.
+        print(f"[LOGGING] Log file: {log_file}")
+        print(f"[LOGGING]   Max size: {max_bytes // (1024*1024)} MB")
+        print(f"[LOGGING]   Backups:  {backup_count}")
+
         file_formatter = structlog.stdlib.ProcessorFormatter(
             processors=[
                 structlog.stdlib.ProcessorFormatter.remove_processors_meta,
@@ -128,12 +139,17 @@ def setup_structlog(config: dict):
         )
         file_handler.setFormatter(file_formatter)
         root.addHandler(file_handler)
+        print(f"[LOGGING] ✓ File handler attached")
+
+    print(f"[LOGGING] ✓ Logging ready\n")
 
 
 def load_config(config_path: str) -> Dict[str, dict]:
     """Load configuration from .config INI file."""
+    print(f"[CONFIG] Loading config from: {config_path}")
+
     if not os.path.exists(config_path):
-        print(f"ERROR: Config file not found: {config_path}", file=sys.stderr)
+        print(f"[CONFIG] ✗ FATAL: Config file not found: {config_path}")
         sys.exit(1)
 
     cp = configparser.ConfigParser()
@@ -142,6 +158,9 @@ def load_config(config_path: str) -> Dict[str, dict]:
     config: dict = {}
     for section in cp.sections():
         config[section] = dict(cp.items(section))
+        print(f"[CONFIG] ✓ Loaded section [{section}] ({len(config[section])} keys)")
+
+    print(f"[CONFIG] ✓ Config loaded ({len(config)} sections)\n")
     return config
 
 
@@ -151,12 +170,16 @@ def daemonize(pid_file: str):
 
     Writes PID to pid_file for systemd/init management.
     """
+    print(f"[DAEMON] Daemonizing process...")
+
     # First fork
     try:
         pid = os.fork()
         if pid > 0:
+            print(f"[DAEMON] First fork — parent exiting (child PID: {pid})")
             sys.exit(0)
     except OSError as e:
+        print(f"[DAEMON] ✗ First fork FAILED: {e}")
         logger.error("daemon.first_fork_failed", error=str(e))
         sys.exit(1)
 
@@ -168,12 +191,14 @@ def daemonize(pid_file: str):
     try:
         pid = os.fork()
         if pid > 0:
+            print(f"[DAEMON] Second fork — intermediate exiting (daemon PID: {pid})")
             sys.exit(0)
     except OSError as e:
+        print(f"[DAEMON] ✗ Second fork FAILED: {e}")
         logger.error("daemon.second_fork_failed", error=str(e))
         sys.exit(1)
 
-    # Redirect stdio using raw FDs — avoids fragile close-after-dup2
+    # Redirect stdio
     sys.stdout.flush()
     sys.stderr.flush()
 
@@ -207,6 +232,12 @@ def run_cli_mode(config: dict, input_path: str, output_path: str):
 
     Useful for testing and batch processing.
     """
+    print(f"\n{'='*60}")
+    print(f"[CLI] Starting CLI translation mode")
+    print(f"[CLI]   Input:  {input_path}")
+    print(f"[CLI]   Output: {output_path}")
+    print(f"{'='*60}\n")
+
     parser = H3CLogParser()
     fmt_config = config.get("output", {})
     formatter = SGBoxFormatter(
@@ -216,6 +247,7 @@ def run_cli_mode(config: dict, input_path: str, output_path: str):
     )
 
     is_csv = input_path.lower().endswith(".csv")
+    print(f"[CLI] Input format: {'CSV' if is_csv else 'raw syslog'}")
 
     translated_count = 0
     total_count = 0
@@ -230,16 +262,19 @@ def run_cli_mode(config: dict, input_path: str, output_path: str):
                 if not line:
                     continue
 
-                if is_csv:
-                    parsed = parser.parse_csv_line(line)
-                else:
-                    parsed = parser.parse(line)
+                match is_csv:
+                    case True:
+                        parsed = parser.parse_csv_line(line)
+                    case False:
+                        parsed = parser.parse(line)
 
                 if parsed:
                     formatted = formatter.format(parsed)
                     if formatted:
                         out_file.write(formatted + "\n")
                         translated_count += 1
+                        if translated_count % 100 == 0:
+                            print(f"[CLI] Progress: {translated_count} translated / {total_count} total")
 
     finally:
         if out_file != sys.stdout:
@@ -247,14 +282,16 @@ def run_cli_mode(config: dict, input_path: str, output_path: str):
 
     logger.info("cli.complete",
                 translated=translated_count, total=total_count)
-    print(f"\n=== Translation Summary ===")
-    print(f"Input:      {input_path}")
-    print(f"Output:     {output_path}")
-    print(f"Total:      {total_count} lines")
-    print(f"Translated: {translated_count} lines")
-    print(f"Failed:     {total_count - translated_count} lines")
-    print(f"Parser stats:    {parser.stats}")
-    print(f"Formatter stats: {formatter.stats}")
+    print(f"\n{'='*60}")
+    print(f"=== Translation Summary ===")
+    print(f"  Input:      {input_path}")
+    print(f"  Output:     {output_path}")
+    print(f"  Total:      {total_count} lines")
+    print(f"  Translated: {translated_count} lines")
+    print(f"  Failed:     {total_count - translated_count} lines")
+    print(f"  Parser stats:    {parser.stats}")
+    print(f"  Formatter stats: {formatter.stats}")
+    print(f"{'='*60}")
 
 
 async def run_server(config: dict):
@@ -263,7 +300,12 @@ async def run_server(config: dict):
 
     Pipeline: syslog receiver → parser → formatter → output server / forwarder
     """
+    print(f"\n{'='*60}")
+    print(f"[SERVER] Starting H3C-to-SGBox Translator Server v2.0.0")
+    print(f"{'='*60}\n")
+
     # ── Initialize components ──────────────────────────────────────
+    print(f"[SERVER] Initializing components...")
     parser = H3CLogParser()
 
     fmt_config = config.get("output", {})
@@ -275,25 +317,40 @@ async def run_server(config: dict):
 
     sgbox_config = config.get("sgbox", {})
     mode = sgbox_config.get("mode", "pull").lower()
+    print(f"[SERVER] Output mode: {mode}")
 
-    # ── Initialize GPG encryption (SGBox at-rest compatible) ───────
+    # ── Initialize GPG encryption ─────────────────────────────────
+    print(f"[SERVER] Initializing encryption module...")
     encryption = SGBoxEncryption(config)
 
     # ── Choose output mode ─────────────────────────────────────────
     output_server = None
     forwarder = None
 
-    if mode == "push":
-        forwarder = SyslogForwarder(config)
-    else:
-        output_server = SyslogOutputServer(config)
+    match mode:
+        case "push":
+            print(f"[SERVER] Mode=push → initializing SyslogForwarder")
+            forwarder = SyslogForwarder(config)
+        case "pull":
+            print(f"[SERVER] Mode=pull → initializing SyslogOutputServer")
+            output_server = SyslogOutputServer(config)
+        case _:
+            print(f"[SERVER] ✗ Unknown mode '{mode}', defaulting to pull")
+            output_server = SyslogOutputServer(config)
 
-    # ── Message handler (async, called for each received syslog message) ──
+    # ── Message handler ────────────────────────────────────────────
     async def handle_message(message: str, client_ip: str):
         """Parse, format, encrypt (if enabled), and send a single H3C log message."""
+        print(f"[PIPELINE] Processing message from {client_ip}: {message[:120]}...")
+
         parsed = parser.parse(message)
         if not parsed:
+            print(f"[PIPELINE] ✗ Parser returned None — message could not be parsed")
             return
+
+        print(f"[PIPELINE] ✓ Parsed: proto={parsed.get('proto', '?')} "
+              f"src={parsed.get('src', '?')} dst={parsed.get('dst', '?')} "
+              f"action={parsed.get('action', '?')}")
 
         syslog_msg = formatter.format_syslog(
             parsed,
@@ -302,29 +359,49 @@ async def run_server(config: dict):
         )
 
         if syslog_msg:
+            print(f"[PIPELINE] ✓ Formatted syslog: {syslog_msg[:120]}...")
+
             # Encrypt at rest if SGBox encryption is enabled
             if encryption.is_enabled:
+                print(f"[PIPELINE] Encrypting message...")
                 syslog_msg = await encryption.encrypt(syslog_msg)
+                print(f"[PIPELINE] ✓ Encrypted ({len(syslog_msg)} bytes)")
 
             if output_server:
+                print(f"[PIPELINE] Sending to output server (pull mode)...")
                 await output_server.send(syslog_msg)
             elif forwarder:
+                print(f"[PIPELINE] Forwarding to SGBox (push mode)...")
                 await forwarder.send(syslog_msg)
 
+            print(f"[PIPELINE] ✓ Message delivered successfully")
+        else:
+            print(f"[PIPELINE] ✗ Formatter returned None — missing required fields")
+
     # ── Start syslog receiver ──────────────────────────────────────
+    print(f"\n[SERVER] Starting syslog receiver...")
     receiver = SyslogReceiver(config, handle_message)
     await receiver.start()
 
     # ── Start output server or connect forwarder ───────────────────
-    if output_server:
-        await output_server.start()
-    elif forwarder:
-        try:
-            await forwarder.connect()
-        except Exception as e:
-            logger.error("forwarder.initial_connect_failed",
-                          error=str(e),
-                          msg="Will retry on first message")
+    match mode:
+        case "pull":
+            if output_server:
+                print(f"\n[SERVER] Starting output server (pull mode)...")
+                await output_server.start()
+        case "push":
+            if forwarder:
+                async def _init_forwarder():
+                    try:
+                        await forwarder.connect()
+                        print(f"[SERVER] ✓ Forwarder connected to SGBox")
+                    except Exception as e:
+                        print(f"[SERVER] ✗ Forwarder initial connect FAILED: {e}")
+                        print(f"[SERVER]   Will retry on first message")
+                        logger.error("forwarder.initial_connect_failed",
+                                      error=str(e),
+                                      msg="Will retry on first message")
+                asyncio.create_task(_init_forwarder())
 
     # ── Start async API server ─────────────────────────────────────
     def get_stats():
@@ -335,16 +412,20 @@ async def run_server(config: dict):
             stats["forwarder"] = forwarder.stats
         return stats
 
+    print(f"\n[SERVER] Starting API server...")
     api = APIServer(config, parser, formatter, stats_provider=get_stats)
     try:
         await api.start()
+        print(f"[SERVER] ✓ API server started")
     except Exception as e:
+        print(f"[SERVER] ✗ API server FAILED to start: {e}")
         logger.warning("api.start_failed", error=str(e))
 
     # ── Wait for shutdown signal ───────────────────────────────────
     shutdown_event = asyncio.Event()
 
     def signal_handler():
+        print(f"\n[SERVER] Shutdown signal received!")
         logger.info("shutdown.signal_received")
         shutdown_event.set()
 
@@ -353,7 +434,21 @@ async def run_server(config: dict):
         loop.add_signal_handler(sig, signal_handler)
 
     output_port = sgbox_config.get("output_port", sgbox_config.get("port", "1514"))
+
+    print(f"\n{'='*60}")
+    print(f"[SERVER] ✓ TRANSLATOR RUNNING")
+    print(f"[SERVER]   UDP port:    {config.get('server', {}).get('syslog_udp_port', '514')}")
+    print(f"[SERVER]   TCP port:    {config.get('server', {}).get('syslog_tcp_port', '514')}")
+    print(f"[SERVER]   TLS port:    {config.get('server', {}).get('syslog_tls_port', '6514')}")
+    print(f"[SERVER]   API port:    {config.get('server', {}).get('api_port', '8443')}")
+    print(f"[SERVER]   Output mode: {mode}")
+    print(f"[SERVER]   Output port: {output_port}")
+    print(f"[SERVER]   Encryption:  {'enabled' if encryption.is_enabled else 'disabled'}")
+    print(f"{'='*60}")
+    print(f"[SERVER] Waiting for syslog messages... (Ctrl+C to stop)\n")
+
     logger.info("translator.running",
+                syslog_udp_port=config.get("server", {}).get("syslog_udp_port", "514"),
                 syslog_tls_port=config.get("server", {}).get("syslog_tls_port", "6514"),
                 syslog_tcp_port=config.get("server", {}).get("syslog_tcp_port", "514"),
                 api_port=config.get("server", {}).get("api_port", "8443"),
@@ -363,6 +458,7 @@ async def run_server(config: dict):
     await shutdown_event.wait()
 
     # ── Cleanup ────────────────────────────────────────────────────
+    print(f"\n[SERVER] Shutting down...")
     logger.info("translator.shutting_down")
     await receiver.stop()
     await api.stop()
@@ -372,6 +468,13 @@ async def run_server(config: dict):
         await forwarder.close()
 
     # Final stats
+    print(f"\n{'='*60}")
+    print(f"[SERVER] Final Statistics:")
+    print(f"  Parser:    {parser.stats}")
+    print(f"  Formatter: {formatter.stats}")
+    print(f"  Receiver:  {receiver.stats}")
+    print(f"{'='*60}")
+
     logger.info("translator.final_stats",
                 parser=parser.stats,
                 formatter=formatter.stats,
@@ -380,6 +483,10 @@ async def run_server(config: dict):
 
 def main():
     """Entry point."""
+    print(f"\n{'='*60}")
+    print(f"  H3C-to-SGBox Secure Log Translator v2.0.0")
+    print(f"{'='*60}\n")
+
     arg_parser = argparse.ArgumentParser(
         description="H3C to SGBox Secure Log Translator (v2.0.0 — async + Debian 13)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -424,15 +531,18 @@ Examples:
     # Load config
     config = load_config(args.config)
 
-    # Setup structlog (replaces old logging.handlers boilerplate)
+    # Setup structlog
     setup_structlog(config)
 
+    print(f"[MAIN] Starting translator v2.0.0")
+    print(f"[MAIN] Config: {args.config}")
     logger.info("translator.starting", version="2.0.0")
     logger.info("config.loaded", path=args.config)
 
     # CLI mode
     if args.input:
         output = args.output or args.input.rsplit(".", 1)[0] + "_translated.log"
+        print(f"[MAIN] Running in CLI mode")
         run_cli_mode(config, args.input, output)
         return
 
@@ -441,9 +551,13 @@ Examples:
         pid_file = config.get("server", {}).get(
             "pid_file", "/var/run/h3c-translator.pid"
         )
+        print(f"[MAIN] Running in daemon mode (PID file: {pid_file})")
         daemonize(pid_file)
+    else:
+        print(f"[MAIN] Running in foreground mode")
 
     # Server mode — use uvloop for high-performance async
+    print(f"[MAIN] Using uvloop for async event loop")
     uvloop.run(run_server(config))
 
 

@@ -100,6 +100,7 @@ class H3CLogParser:
             "failed": 0,
             "total": 0,
         }
+        print(f"[PARSER] Initialized with {len(self._field_map)} field mappings")
 
     @property
     def stats(self) -> Dict[str, int]:
@@ -123,6 +124,7 @@ class H3CLogParser:
         if not raw_line or not raw_line.strip():
             with self._stats_lock:
                 self._stats["failed"] += 1
+            print(f"[PARSER] ✗ Empty line received, skipping")
             return None
 
         line = raw_line.strip()
@@ -130,13 +132,17 @@ class H3CLogParser:
 
         # ── Extract syslog header ──────────────────────────────────
         header_match = SYSLOG_HEADER_RE.search(line)
-        if header_match:
-            result["_src_ip"] = header_match.group("src_ip")
-            result["hostname"] = header_match.group("hostname")
-            result["_module"] = header_match.group("module")
-            payload = line[header_match.end():]
-        else:
-            payload = line
+        match header_match:
+            case None:
+                print(f"[PARSER] No syslog header found, parsing raw payload")
+                payload = line
+            case _:
+                result["_src_ip"] = header_match.group("src_ip")
+                result["hostname"] = header_match.group("hostname")
+                result["_module"] = header_match.group("module")
+                payload = line[header_match.end():]
+                print(f"[PARSER] Header: src_ip={result['_src_ip']} "
+                      f"hostname={result['hostname']} module={result['_module']}")
 
         # ── Extract key(id)=value fields ───────────────────────────
         fields_found = 0
@@ -145,30 +151,35 @@ class H3CLogParser:
             raw_value = match.group("value").strip()
 
             mapped_key = self._field_map.get(raw_key)
-            if mapped_key:
-                # Validate IP address fields
-                if mapped_key in _IP_FIELDS and raw_value:
+            match mapped_key:
+                case None:
+                    result["_raw_" + raw_key] = raw_value
+                case _ if mapped_key in _IP_FIELDS and raw_value:
                     if not self._is_valid_ip(raw_value):
+                        print(f"[PARSER] ✗ Invalid IP for {mapped_key}: {raw_value[:40]}")
                         logger.warning("parser.invalid_ip",
                                         field=mapped_key,
                                         value=raw_value[:40])
                         continue
-                result[mapped_key] = raw_value
-                fields_found += 1
-            else:
-                result["_raw_" + raw_key] = raw_value
+                    result[mapped_key] = raw_value
+                    fields_found += 1
+                    print(f"[PARSER]   {mapped_key}={raw_value}")
+                case _:
+                    result[mapped_key] = raw_value
+                    fields_found += 1
+                    print(f"[PARSER]   {mapped_key}={raw_value}")
 
         if fields_found == 0:
             with self._stats_lock:
                 self._stats["failed"] += 1
+            print(f"[PARSER] ✗ No recognized fields found in: {line[:120]}")
             logger.debug("parser.no_fields", line=line[:120])
             return None
 
         # ── Derive action from Event field ─────────────────────────
         event_raw = result.get("event", "")
         result["action"] = self._derive_action(event_raw)
-
-        # Clean up: no action needed — formatter handles empty/placeholder values
+        print(f"[PARSER] ✓ Parsed {fields_found} fields, action={result['action']}")
 
         with self._stats_lock:
             self._stats["parsed"] += 1
@@ -187,27 +198,30 @@ class H3CLogParser:
             Parsed dictionary or None.
         """
         if not csv_line or csv_line.startswith("Timestamp"):
+            print(f"[PARSER] Skipping CSV header or empty line")
             return None
 
         # Use stdlib csv.reader for correct parsing
         try:
             reader = csv.reader(io.StringIO(csv_line))
             parts = next(reader)
-        except (StopIteration, csv.Error):
+        except (StopIteration, csv.Error) as e:
+            print(f"[PARSER] CSV parse failed ({e}), trying raw parse")
             return self.parse(csv_line)
 
         if len(parts) >= 3:
             timestamp = parts[0].strip()
             hostname = parts[1].strip() if len(parts) > 1 else ""
             raw_data = parts[2].strip()
+            print(f"[PARSER] CSV: timestamp={timestamp} hostname={hostname}")
             result = self.parse(raw_data)
             if result:
                 result["_csv_timestamp"] = timestamp
-                # Preserve the CSV hostname if not already set by syslog header
                 if hostname and "hostname" not in result:
                     result["hostname"] = hostname
             return result
 
+        print(f"[PARSER] CSV has <3 fields, trying raw parse")
         return self.parse(csv_line)
 
     def _derive_action(self, event_raw: str) -> str:
@@ -218,21 +232,31 @@ class H3CLogParser:
         "(9)Session deleted"  → "close"
         "(1)Session denied"   → "deny"
         """
-        match = EVENT_CODE_RE.match(event_raw)
-        if match:
-            code = match.group(1)
-            return EVENT_ACTION_MAP.get(code, "unknown")
+        match_obj = EVENT_CODE_RE.match(event_raw)
+        match match_obj:
+            case None:
+                pass  # Fall through to text-based matching
+            case _:
+                code = match_obj.group(1)
+                action = EVENT_ACTION_MAP.get(code, "unknown")
+                print(f"[PARSER] Event code ({code}) → action={action}")
+                return action
 
         # Fallback: try to infer from text
         event_lower = event_raw.lower()
-        if "created" in event_lower or "permit" in event_lower:
-            return "permit"
-        elif "denied" in event_lower or "deny" in event_lower:
-            return "deny"
-        elif "deleted" in event_lower or "closed" in event_lower:
-            return "close"
-
-        return "unknown"
+        match event_lower:
+            case s if "created" in s or "permit" in s:
+                print(f"[PARSER] Event text '{event_raw}' → action=permit")
+                return "permit"
+            case s if "denied" in s or "deny" in s:
+                print(f"[PARSER] Event text '{event_raw}' → action=deny")
+                return "deny"
+            case s if "deleted" in s or "closed" in s:
+                print(f"[PARSER] Event text '{event_raw}' → action=close")
+                return "close"
+            case _:
+                print(f"[PARSER] Event text '{event_raw}' → action=unknown")
+                return "unknown"
 
     @staticmethod
     def _is_valid_ip(value: str) -> bool:

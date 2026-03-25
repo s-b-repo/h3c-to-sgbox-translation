@@ -3,9 +3,9 @@ Async HTTPS REST API Server (aiohttp)
 
 Provides HTTP API endpoints for:
   - POST /api/v1/translate      — translate a single H3C log line
-  - POST /api/v1/translate/bulk  — translate multiple log lines
-  - GET  /api/v1/health          — health check
-  - GET  /api/v1/stats           — translation statistics
+  - POST /api/v1/translate/bulk — translate multiple log lines
+  - GET  /api/v1/health         — health check
+  - GET  /api/v1/stats          — translation statistics
 
 Security features:
   - API key authentication (X-API-Key header) via middleware
@@ -67,6 +67,7 @@ class _RateLimiter:
             timestamps = [t for t in timestamps if now - t < self._window]
             if len(timestamps) >= self._max:
                 self._hits[client_ip] = timestamps
+                print(f"[API] ✗ Rate limit hit for {client_ip} ({len(timestamps)}/{self._max})")
                 return False
             timestamps.append(now)
             self._hits[client_ip] = timestamps
@@ -80,6 +81,8 @@ class _RateLimiter:
         ]
         for key in stale_keys:
             del self._hits[key]
+        if stale_keys:
+            print(f"[API] Evicted {len(stale_keys)} stale IPs from rate limiter")
 
 
 class APIServer:
@@ -111,6 +114,10 @@ class APIServer:
             security_config.get("trusted_proxies", "")
         )
 
+        print(f"[API] Initialized")
+        print(f"[API]   API key:   {'configured' if self._api_key else 'NOT SET'}")
+        print(f"[API]   Whitelist: {len(self._allowed_networks) if self._allowed_networks else 'disabled'} network(s)")
+
     async def start(self):
         """Start the aiohttp API server on the running event loop."""
         server_config = self.config.get("server", {})
@@ -119,6 +126,8 @@ class APIServer:
 
         port = int(server_config.get("api_port", 8443))
         bind_address = server_config.get("bind_address", "127.0.0.1")
+
+        print(f"\n[API] Starting API server on {bind_address}:{port}...")
 
         # ── Build aiohttp application ──────────────────────────────
         self._app = web.Application(
@@ -137,6 +146,7 @@ class APIServer:
         self._app.router.add_post("/api/v1/translate", self._handle_translate)
         self._app.router.add_post("/api/v1/translate/bulk", self._handle_translate_bulk)
         self._app.router.add_route("OPTIONS", "/{path:.*}", self._handle_options)
+        print(f"[API] ✓ Routes registered: /health, /stats, /translate, /translate/bulk")
 
         # ── TLS setup ──────────────────────────────────────────────
         ssl_ctx = None
@@ -144,31 +154,42 @@ class APIServer:
         key_file = tls_config.get("key_file", "")
         allow_plaintext = security_config.get("allow_plaintext", "false").lower() == "true"
 
-        if cert_file and key_file:
-            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
-            ssl_ctx.options |= ssl.OP_NO_COMPRESSION
-            ssl_ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
-            logger.info("api.tls_enabled", bind=bind_address, port=port)
-        elif allow_plaintext:
-            logger.warning(
-                "api.tls_disabled",
-                bind=bind_address, port=port,
-                msg="Running on PLAIN HTTP — insecure, dev only",
-            )
-        else:
-            raise RuntimeError(
-                "TLS cert_file/key_file not configured and allow_plaintext is "
-                "not enabled. Refusing to start API server over plain HTTP. "
-                "Set [security] allow_plaintext = true to override."
-            )
+        match (bool(cert_file and key_file), allow_plaintext):
+            case (True, _):
+                ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+                ssl_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+                ssl_ctx.options |= ssl.OP_NO_COMPRESSION
+                ssl_ctx.load_cert_chain(certfile=cert_file, keyfile=key_file)
+                print(f"[API] ✓ TLS enabled")
+                print(f"[API]   Cert: {cert_file}")
+                print(f"[API]   Key:  {key_file}")
+                logger.info("api.tls_enabled", bind=bind_address, port=port)
+            case (False, True):
+                print(f"[API] ⚠ Running on PLAIN HTTP — insecure, dev only!")
+                logger.warning(
+                    "api.tls_disabled",
+                    bind=bind_address, port=port,
+                    msg="Running on PLAIN HTTP — insecure, dev only",
+                )
+            case (False, False):
+                print(f"[API] ✗ FATAL: No TLS certs and allow_plaintext=false")
+                print(f"[API]   Set [security] allow_plaintext = true to override")
+                raise RuntimeError(
+                    "TLS cert_file/key_file not configured and allow_plaintext is "
+                    "not enabled. Refusing to start API server over plain HTTP. "
+                    "Set [security] allow_plaintext = true to override."
+                )
 
-        if self._api_key:
-            logger.info("api.auth_enabled")
-        else:
-            logger.warning("api.auth_disabled", msg="No api_key configured")
+        match bool(self._api_key):
+            case True:
+                print(f"[API] ✓ API key authentication enabled")
+                logger.info("api.auth_enabled")
+            case False:
+                print(f"[API] ⚠ No api_key configured — API is unauthenticated!")
+                logger.warning("api.auth_disabled", msg="No api_key configured")
 
         if self._allowed_networks:
+            print(f"[API] ✓ IP whitelist enabled ({len(self._allowed_networks)} networks)")
             logger.info("api.ip_whitelist_enabled",
                         networks=len(self._allowed_networks))
 
@@ -183,12 +204,15 @@ class APIServer:
         )
         await self._site.start()
         protocol = "HTTPS" if ssl_ctx else "HTTP"
+        print(f"[API] ✓ API server STARTED on {protocol}://{bind_address}:{port}")
         logger.info("api.started", protocol=protocol, bind=bind_address, port=port)
 
     async def stop(self):
         """Gracefully stop the API server."""
+        print(f"[API] Stopping API server...")
         if self._runner:
             await self._runner.cleanup()
+            print(f"[API] ✓ API server stopped")
             logger.info("api.stopped")
 
     # ── Middlewares ─────────────────────────────────────────────────
@@ -203,16 +227,19 @@ class APIServer:
             except ValueError:
                 is_trusted = False
 
-            if is_trusted:
-                xff = request.headers.get("X-Forwarded-For", "")
-                if xff:
-                    # Take the rightmost untrusted IP (last entry added by the proxy)
-                    forwarded_ip = xff.split(",")[0].strip()
-                    try:
-                        ipaddress.ip_address(forwarded_ip)
-                        return forwarded_ip
-                    except ValueError:
-                        pass
+            match is_trusted:
+                case True:
+                    xff = request.headers.get("X-Forwarded-For", "")
+                    if xff:
+                        forwarded_ip = xff.split(",")[0].strip()
+                        try:
+                            ipaddress.ip_address(forwarded_ip)
+                            print(f"[API] Trusted proxy {peer_ip}, using forwarded IP: {forwarded_ip}")
+                            return forwarded_ip
+                        except ValueError:
+                            print(f"[API] ✗ Invalid X-Forwarded-For IP: {forwarded_ip}")
+                case False:
+                    pass
         return peer_ip
 
     @web.middleware
@@ -226,12 +253,16 @@ class APIServer:
             except ValueError:
                 allowed = False
 
-            if not allowed:
-                logger.warning("api.ip_rejected", client_ip=client_ip)
-                raise web.HTTPForbidden(
-                    text='{"error": "Forbidden"}',
-                    content_type="application/json",
-                )
+            match allowed:
+                case False:
+                    print(f"[API] ✗ IP REJECTED: {client_ip} (not in whitelist)")
+                    logger.warning("api.ip_rejected", client_ip=client_ip)
+                    raise web.HTTPForbidden(
+                        text='{"error": "Forbidden"}',
+                        content_type="application/json",
+                    )
+                case True:
+                    pass
         return await handler(request)
 
     @web.middleware
@@ -239,12 +270,17 @@ class APIServer:
         """Validate API key from X-API-Key header."""
         if self._api_key:
             provided = request.headers.get("X-API-Key", "")
-            if not provided or not hmac.compare_digest(provided, self._api_key):
-                logger.warning("api.auth_failure", client_ip=self._get_client_ip(request))
-                raise web.HTTPUnauthorized(
-                    text='{"error": "Unauthorized"}',
-                    content_type="application/json",
-                )
+            match bool(provided and hmac.compare_digest(provided, self._api_key)):
+                case False:
+                    client_ip = self._get_client_ip(request)
+                    print(f"[API] ✗ AUTH FAILED from {client_ip} on {request.method} {request.path}")
+                    logger.warning("api.auth_failure", client_ip=client_ip)
+                    raise web.HTTPUnauthorized(
+                        text='{"error": "Unauthorized"}',
+                        content_type="application/json",
+                    )
+                case True:
+                    pass
         return await handler(request)
 
     @web.middleware
@@ -252,6 +288,7 @@ class APIServer:
         """Per-IP rate limiting."""
         client_ip = self._get_client_ip(request)
         if not await self._rate_limiter.is_allowed(client_ip):
+            print(f"[API] ✗ RATE LIMITED: {client_ip}")
             logger.warning("api.rate_limited", client_ip=client_ip)
             raise web.HTTPTooManyRequests(
                 text='{"error": "Too many requests"}',
@@ -271,8 +308,6 @@ class APIServer:
         response.headers["Content-Security-Policy"] = "default-src 'none'"
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         response.headers["Pragma"] = "no-cache"
-        # CORS — backend-only API: do not allow any browser origin
-        # Omit Access-Control-Allow-Origin entirely to deny cross-origin access
         response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
         response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
         return response
@@ -281,6 +316,7 @@ class APIServer:
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         """GET /api/v1/health — health check."""
+        print(f"[API] Health check from {self._get_client_ip(request)}")
         return web.json_response({
             "status": "healthy",
             "service": "h3c-sgbox-translator",
@@ -289,6 +325,8 @@ class APIServer:
 
     async def _handle_stats(self, request: web.Request) -> web.Response:
         """GET /api/v1/stats — translation statistics."""
+        client_ip = self._get_client_ip(request)
+        print(f"[API] Stats request from {client_ip}")
         stats: dict = {}
         if self.parser:
             stats["parser"] = self.parser.stats
@@ -296,27 +334,33 @@ class APIServer:
             stats["formatter"] = self.formatter.stats
         if self.stats_provider:
             stats.update(self.stats_provider())
+        print(f"[API] ✓ Returning stats: {stats}")
         return web.json_response(stats)
 
     async def _handle_translate(self, request: web.Request) -> web.Response:
         """POST /api/v1/translate — translate a single H3C log line."""
+        client_ip = self._get_client_ip(request)
+        print(f"[API] Translate request from {client_ip}")
+
         try:
             body = await request.text()
-        except Exception:
-            logger.error("api.read_body_failed", client_ip=self._get_client_ip(request))
+        except Exception as e:
+            print(f"[API] ✗ Failed to read request body: {e}")
+            logger.error("api.read_body_failed", client_ip=client_ip)
             raise web.HTTPBadRequest(
                 text='{"error": "Failed to read request body"}',
                 content_type="application/json",
             )
 
         if not body:
+            print(f"[API] ✗ Empty request body")
             raise web.HTTPBadRequest(
                 text='{"error": "Empty request body"}',
                 content_type="application/json",
             )
 
-        # Strict body size check for single translate (prevent memory abuse)
         if len(body) > MAX_SINGLE_BODY:
+            print(f"[API] ✗ Body too large: {len(body)} > {MAX_SINGLE_BODY}")
             raise web.HTTPRequestEntityTooLarge(
                 max_size=MAX_SINGLE_BODY,
                 actual_size=len(body),
@@ -330,10 +374,13 @@ class APIServer:
             raw_line = body
 
         if not raw_line:
+            print(f"[API] ✗ Missing 'raw' field or empty body")
             raise web.HTTPBadRequest(
                 text='{"error": "Missing \'raw\' field or empty body"}',
                 content_type="application/json",
             )
+
+        print(f"[API] Parsing: {raw_line[:100]}...")
 
         # Offload CPU-bound parsing/formatting to thread pool
         loop = asyncio.get_running_loop()
@@ -341,6 +388,7 @@ class APIServer:
             None, self.parser.parse, raw_line
         )
         if not parsed:
+            print(f"[API] ✗ Could not parse H3C log line")
             return web.json_response(
                 {"error": "Could not parse H3C log line"},
                 status=422,
@@ -349,6 +397,7 @@ class APIServer:
         formatted = await loop.run_in_executor(
             None, self.formatter.format, parsed
         )
+        print(f"[API] ✓ Translated: {formatted[:100] if formatted else 'None'}...")
         return web.json_response({
             "translated": formatted,
             "parsed_fields": {k: v for k, v in parsed.items()
@@ -357,9 +406,13 @@ class APIServer:
 
     async def _handle_translate_bulk(self, request: web.Request) -> web.Response:
         """POST /api/v1/translate/bulk — translate multiple H3C log lines."""
+        client_ip = self._get_client_ip(request)
+        print(f"[API] Bulk translate request from {client_ip}")
+
         try:
             data = await request.json()
-        except Exception:
+        except Exception as e:
+            print(f"[API] ✗ Invalid JSON body: {e}")
             raise web.HTTPBadRequest(
                 text='{"error": "Invalid JSON body"}',
                 content_type="application/json",
@@ -367,16 +420,20 @@ class APIServer:
 
         lines = data.get("lines", [])
         if not lines:
+            print(f"[API] ✗ Missing 'lines' array")
             raise web.HTTPBadRequest(
                 text='{"error": "Missing \'lines\' array"}',
                 content_type="application/json",
             )
 
         if len(lines) > MAX_BULK_LINES:
+            print(f"[API] ✗ Bulk request too large: {len(lines)} > {MAX_BULK_LINES}")
             raise web.HTTPBadRequest(
                 text=f'{{"error": "Bulk request exceeds maximum of {MAX_BULK_LINES} lines"}}',
                 content_type="application/json",
             )
+
+        print(f"[API] Processing {len(lines)} lines...")
 
         # Offload CPU-bound bulk translation to thread pool
         loop = asyncio.get_running_loop()
@@ -384,33 +441,40 @@ class APIServer:
             None, self._translate_bulk_sync, lines
         )
 
+        translated_count = len([r for r in results if r.get("translated")])
+        print(f"[API] ✓ Bulk complete: {translated_count}/{len(lines)} translated")
+
         return web.json_response({
             "count": len(results),
-            "translated": len([r for r in results if r.get("translated")]),
+            "translated": translated_count,
             "results": results,
         })
 
     def _translate_bulk_sync(self, lines: list) -> list:
         """Synchronous bulk translation (runs in executor thread)."""
         results = []
-        for line in lines:
+        for i, line in enumerate(lines):
             parsed = self.parser.parse(line)
-            if parsed:
-                formatted = self.formatter.format(parsed)
-                results.append({
-                    "input": line[:100],
-                    "translated": formatted,
-                })
-            else:
-                results.append({
-                    "input": line[:100],
-                    "translated": None,
-                    "error": "unparsable",
-                })
+            match parsed:
+                case None:
+                    results.append({
+                        "input": line[:100],
+                        "translated": None,
+                        "error": "unparsable",
+                    })
+                    print(f"[API] Bulk [{i+1}/{len(lines)}] ✗ unparsable")
+                case _:
+                    formatted = self.formatter.format(parsed)
+                    results.append({
+                        "input": line[:100],
+                        "translated": formatted,
+                    })
+                    print(f"[API] Bulk [{i+1}/{len(lines)}] ✓ translated")
         return results
 
     async def _handle_options(self, request: web.Request) -> web.Response:
         """OPTIONS — CORS pre-flight."""
+        print(f"[API] OPTIONS pre-flight from {self._get_client_ip(request)}")
         return web.Response(
             status=204,
             headers={
@@ -425,8 +489,9 @@ class APIServer:
 
     @staticmethod
     def _parse_allowed_ips(allowed_str: str) -> list | None:
-        """Parse comma-separated IP/CIDR list into network objects."""
-        if not allowed_str or allowed_str.strip() == "0.0.0.0/0":
+        """Parse comma-separated IP list into network objects."""
+        if not allowed_str or allowed_str.strip() in ("0.0.0.0", "0.0.0.0/0"):
+            print(f"[API] Allowed IPs: ALL (no filtering)")
             return None
 
         networks = []
@@ -435,10 +500,13 @@ class APIServer:
             if not entry:
                 continue
             try:
-                if "/" in entry:
-                    networks.append(ipaddress.ip_network(entry, strict=False))
-                else:
-                    networks.append(ipaddress.ip_network(entry + "/32", strict=False))
+                match "/" in entry:
+                    case True:
+                        networks.append(ipaddress.ip_network(entry, strict=False))
+                    case False:
+                        networks.append(ipaddress.ip_network(entry + "/32", strict=False))
+                print(f"[API] ✓ Allowed network: {entry}")
             except ValueError as e:
+                print(f"[API] ✗ Invalid IP/CIDR: {entry} — {e}")
                 logger.warning("api.invalid_ip_cidr", entry=entry, error=str(e))
         return networks or None

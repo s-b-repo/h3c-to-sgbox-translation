@@ -11,7 +11,7 @@ Output format:
 Dependencies: structlog
 """
 
-import threading  # retained for backward-compat; lock guards stats in sync code
+import threading
 
 import structlog
 from typing import Dict, Optional, List
@@ -69,16 +69,26 @@ class SGBoxFormatter:
         self.include_hostname = include_hostname
         self.include_timestamp = include_timestamp
 
-        if self.output_format == "core":
-            self._fields = CORE_FIELDS[:]
-        else:
-            self._fields = CORE_FIELDS + EXTENDED_FIELDS
+        match self.output_format:
+            case "core":
+                self._fields = CORE_FIELDS[:]
+                print(f"[FORMATTER] Format: core ({len(self._fields)} fields)")
+            case "extended":
+                self._fields = CORE_FIELDS + EXTENDED_FIELDS
+                print(f"[FORMATTER] Format: extended ({len(self._fields)} fields)")
+            case _:
+                self._fields = CORE_FIELDS + EXTENDED_FIELDS
+                print(f"[FORMATTER] Unknown format '{output_format}', defaulting to extended ({len(self._fields)} fields)")
 
         self._stats_lock = threading.Lock()
         self._stats = {
             "formatted": 0,
             "skipped": 0,
         }
+
+        print(f"[FORMATTER] Initialized")
+        print(f"[FORMATTER]   Include hostname:  {include_hostname}")
+        print(f"[FORMATTER]   Include timestamp: {include_timestamp}")
 
     @property
     def stats(self) -> Dict[str, int]:
@@ -100,14 +110,19 @@ class SGBoxFormatter:
         if not parsed:
             with self._stats_lock:
                 self._stats["skipped"] += 1
+            print(f"[FORMATTER] ✗ Skipped — empty parsed dict")
             return None
 
-        # Require at least proto and one of src/dst
-        if "proto" not in parsed:
-            with self._stats_lock:
-                self._stats["skipped"] += 1
-            logger.debug("formatter.missing_proto")
-            return None
+        # Require at least proto
+        match "proto" in parsed:
+            case False:
+                with self._stats_lock:
+                    self._stats["skipped"] += 1
+                print(f"[FORMATTER] ✗ Skipped — missing 'proto' field (required)")
+                logger.debug("formatter.missing_proto")
+                return None
+            case True:
+                pass
 
         parts = []
         for field in self._fields:
@@ -119,11 +134,14 @@ class SGBoxFormatter:
         if not parts:
             with self._stats_lock:
                 self._stats["skipped"] += 1
+            print(f"[FORMATTER] ✗ Skipped — no fields had values")
             return None
 
+        result = " ".join(parts)
         with self._stats_lock:
             self._stats["formatted"] += 1
-        return " ".join(parts)
+        print(f"[FORMATTER] ✓ Formatted ({len(parts)} fields): {result[:120]}...")
+        return result
 
     def format_syslog(self, parsed: Dict[str, str],
                       facility: str = "local0",
@@ -135,24 +153,31 @@ class SGBoxFormatter:
         """
         msg = self.format(parsed)
         if not msg:
+            print(f"[FORMATTER] ✗ format_syslog — base format returned None")
             return None
 
         pri = self._calculate_pri(facility, severity)
         hostname = parsed.get("hostname", "h3c-firewall")
         timestamp = parsed.get("_csv_timestamp", "")
 
-        if self.include_timestamp and timestamp:
-            return f"<{pri}>{timestamp} {hostname} h3c-translator: {msg}"
-        else:
-            return f"<{pri}>{hostname} h3c-translator: {msg}"
+        match (self.include_timestamp, bool(timestamp)):
+            case (True, True):
+                result = f"<{pri}>{timestamp} {hostname} h3c-translator: {msg}"
+            case _:
+                result = f"<{pri}>{hostname} h3c-translator: {msg}"
+
+        print(f"[FORMATTER] ✓ Syslog message: <{pri}> host={hostname} ({len(result)} bytes)")
+        return result
 
     def format_batch(self, parsed_list: List[Dict[str, str]]) -> List[str]:
         """Format a batch of parsed logs."""
+        print(f"[FORMATTER] Batch formatting {len(parsed_list)} messages...")
         results = []
         for parsed in parsed_list:
             formatted = self.format(parsed)
             if formatted:
                 results.append(formatted)
+        print(f"[FORMATTER] ✓ Batch complete: {len(results)}/{len(parsed_list)} formatted")
         return results
 
     @staticmethod
@@ -184,4 +209,6 @@ class SGBoxFormatter:
         }
         fac = facilities.get(facility.lower(), 16)
         sev = severities.get(severity.lower(), 6)
-        return (fac * 8) + sev
+        pri = (fac * 8) + sev
+        print(f"[FORMATTER] PRI={pri} (facility={facility}/{fac}, severity={severity}/{sev})")
+        return pri

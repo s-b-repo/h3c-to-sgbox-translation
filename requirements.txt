@@ -1,9 +1,22 @@
-# H3C to SGBox Log Translator — Debian 13 (Trixie)
-# All dependencies actively maintained as of March 2026
-# ─────────────────────────────────────────────────────
-aiohttp>=3.13,<4.0          # Async HTTP server (replaces stdlib http.server)
-uvloop>=0.22                # High-performance asyncio event loop
-structlog>=25.1             # Structured/JSON logging
-tenacity>=9.0               # Retry logic with exponential backoff
-pyOpenSSL>=25.0             # Enhanced TLS/SSL support
-python-gnupg>=0.5.6         # GPG encryption (SGBox at-rest log encryption)
+# H3C to SGBox Log Translator — Python Dependencies
+# Tested on Debian 13 (Trixie) + Python 3.12+
+# Install: pip install --no-cache-dir -r requirements.txt
+# ──────────────────────────────────────────────────────
+
+# Async HTTP framework (REST API server)
+aiohttp>=3.10
+
+# High-performance asyncio event loop (drop-in replacement)
+uvloop>=0.21
+
+# Structured JSON logging
+structlog>=25.1
+
+# Retry logic with exponential backoff (forwarder reconnection)
+tenacity>=9.0
+
+# GPG encryption — SGBox at-rest log encryption
+python-gnupg>=0.5.4
+
+# Enhanced TLS/SSL support (optional, for advanced cert inspection)
+pyOpenSSL>=25.0

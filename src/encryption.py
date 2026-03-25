@@ -61,6 +61,19 @@ class SGBoxEncryption:
         gpg_home = enc_config.get("gpg_home", os.path.expanduser("~/.gnupg"))
         gpg_binary = enc_config.get("gpg_binary", "gpg")
 
+        # MED-05: Validate GPG binary against known safe paths
+        _ALLOWED_GPG_BINARIES = (
+            "gpg", "gpg2",
+            "/usr/bin/gpg", "/usr/bin/gpg2",
+            "/usr/local/bin/gpg", "/usr/local/bin/gpg2",
+        )
+        if gpg_binary not in _ALLOWED_GPG_BINARIES:
+            print(f"[ENCRYPTION] ✗ FATAL: Untrusted gpg_binary path: {gpg_binary}")
+            raise ValueError(
+                f"gpg_binary '{gpg_binary}' is not in the allowed list: "
+                f"{_ALLOWED_GPG_BINARIES}. This prevents command injection."
+            )
+
         print(f"[ENCRYPTION]   GPG home:   {gpg_home}")
         print(f"[ENCRYPTION]   GPG binary: {gpg_binary}")
 
@@ -76,8 +89,6 @@ class SGBoxEncryption:
             raise
 
         self._mode = enc_config.get("mode", "symmetric").lower()
-        self._passphrase = enc_config.get("passphrase", "")
-        self._recipient = enc_config.get("recipient", "")
         self._cipher_algo = enc_config.get("cipher_algo", "AES256")
         self._armor = enc_config.get("armor", "false").lower() == "true"
         self._encrypt_output = enc_config.get("encrypt_output", "false").lower() == "true"
@@ -85,18 +96,32 @@ class SGBoxEncryption:
             "encrypted_log_dir", "/var/log/h3c-translator/encrypted"
         )
 
+        # CRIT-02: Read passphrase from env var first, then config as fallback
+        self._passphrase = os.environ.get(
+            "GPG_PASSPHRASE",
+            enc_config.get("passphrase", ""),
+        )
+        self._recipient = enc_config.get("recipient", "")
+
         print(f"[ENCRYPTION]   Mode:       {self._mode}")
         print(f"[ENCRYPTION]   Cipher:     {self._cipher_algo}")
         print(f"[ENCRYPTION]   Armor:      {self._armor}")
         print(f"[ENCRYPTION]   Log dir:    {self._encrypted_log_dir}")
+        if os.environ.get("GPG_PASSPHRASE"):
+            print(f"[ENCRYPTION]   Passphrase: loaded from GPG_PASSPHRASE env var")
+        else:
+            print(f"[ENCRYPTION]   Passphrase: loaded from config file")
 
         # Validate config
+        _INSECURE_PASSPHRASES = ("", "CHANGE_ME_USE_A_STRONG_PASSPHRASE", "changeme")
         match self._mode:
             case "symmetric":
-                if not self._passphrase:
-                    print(f"[ENCRYPTION] ✗ FATAL: symmetric mode requires a passphrase")
+                if self._passphrase in _INSECURE_PASSPHRASES:
+                    print(f"[ENCRYPTION] ✗ FATAL: symmetric mode requires a real passphrase")
+                    print(f"[ENCRYPTION]   Set GPG_PASSPHRASE env var or update [encryption] passphrase in config")
                     raise ValueError(
-                        "[encryption] mode=symmetric requires a 'passphrase' in config"
+                        "[encryption] mode=symmetric requires a real passphrase. "
+                        "Set GPG_PASSPHRASE env var or update config."
                     )
                 print(f"[ENCRYPTION] ✓ Symmetric mode with passphrase")
             case "asymmetric":

@@ -23,6 +23,10 @@ logger = structlog.get_logger(__name__)
 # Maximum syslog message line size (bytes). Limits StreamReader buffering.
 MAX_SYSLOG_LINE = 8192  # 8 KB — RFC 5424 recommends ≤ 2048, generous margin
 
+# UDP rate limiting: max datagrams per source IP per window
+_UDP_RATE_LIMIT = 500      # max msgs per window
+_UDP_RATE_WINDOW = 10.0    # seconds
+
 
 class _UDPSyslogProtocol(asyncio.DatagramProtocol):
     """
@@ -35,15 +39,34 @@ class _UDPSyslogProtocol(asyncio.DatagramProtocol):
     def __init__(self, receiver: "SyslogReceiver"):
         self._receiver = receiver
         self._transport: asyncio.DatagramTransport | None = None
+        # LOW-01: Per-source UDP rate limiter
+        self._rate_counts: dict[str, int] = {}
+        self._rate_reset_handle: asyncio.TimerHandle | None = None
 
     def connection_made(self, transport: asyncio.DatagramTransport):
         self._transport = transport
+        # Schedule periodic rate counter reset
+        loop = transport.get_extra_info("loop") or asyncio.get_event_loop()
+        self._schedule_rate_reset(loop)
         print(f"[UDP] Datagram endpoint ready")
+
+    def _schedule_rate_reset(self, loop: asyncio.AbstractEventLoop):
+        """Reset rate counters every window."""
+        self._rate_counts.clear()
+        self._rate_reset_handle = loop.call_later(
+            _UDP_RATE_WINDOW, self._schedule_rate_reset, loop
+        )
 
     def datagram_received(self, data: bytes, addr: tuple):
         client_ip = addr[0]
         client_port = addr[1]
-        print(f"[UDP] Datagram received from {client_ip}:{client_port} ({len(data)} bytes)")
+
+        # LOW-01: Per-source rate limiting
+        count = self._rate_counts.get(client_ip, 0)
+        if count >= _UDP_RATE_LIMIT:
+            # Silently drop — don't log every dropped packet
+            return
+        self._rate_counts[client_ip] = count + 1
 
         # IP whitelist check
         if not self._receiver._is_ip_allowed(client_ip):
@@ -56,10 +79,9 @@ class _UDPSyslogProtocol(asyncio.DatagramProtocol):
 
         message = data.decode("utf-8", errors="replace").strip()
         if not message:
-            print(f"[UDP] ✗ Empty message from {client_ip}, ignoring")
             return
 
-        print(f"[UDP] Message from {client_ip}: {message[:200]}...")
+        print(f"[UDP] Message from {client_ip} ({len(message)} bytes)")
         self._receiver._stats["messages_received"] += 1
 
         # Schedule the async handler on the event loop
@@ -80,6 +102,9 @@ class _UDPSyslogProtocol(asyncio.DatagramProtocol):
         logger.warning("receiver.udp_error", error=str(exc))
 
     def connection_lost(self, exc: Exception | None):
+        # Cancel the rate reset timer
+        if self._rate_reset_handle:
+            self._rate_reset_handle.cancel()
         match exc:
             case None:
                 print(f"[UDP] Datagram endpoint closed normally")
@@ -240,14 +265,15 @@ class SyslogReceiver:
         # ── IP whitelist check ─────────────────────────────────────
         if not self._is_ip_allowed(client_ip):
             self._stats["connections_rejected_ip"] += 1
-            print(f"[{proto_label}] ✗ REJECTED — IP {client_ip} is NOT in the allowed_ips whitelist")
+            print(f"[{proto_label}] ✗ REJECTED — IP {client_ip} not in whitelist")
             logger.warning("receiver.ip_rejected", client_ip=client_ip)
             writer.close()
             await writer.wait_closed()
             return
 
-        # ── Connection limit check ─────────────────────────────────
-        if self._active_count >= self._max_connections:
+        # ── Connection limit check (HIGH-01: atomic acquire) ──────
+        acquired = self._connection_semaphore._value > 0
+        if not acquired:
             self._stats["connections_rejected_limit"] += 1
             print(f"[{proto_label}] ✗ REJECTED — Max connections reached ({self._max_connections})")
             logger.warning("receiver.max_connections",
@@ -262,7 +288,7 @@ class SyslogReceiver:
         self._stats["connections_total"] += 1
         conn_id = f"{client_ip}:{client_port}"
         self._active_connections.add(conn_id)
-        print(f"[{proto_label}] ✓ Connection accepted from {conn_id} (active: {self._active_count})")
+        print(f"[{proto_label}] ✓ Connected {conn_id} (active: {self._active_count})")
         logger.info("receiver.connected",
                       client_ip=client_ip, active=self._active_count)
 
@@ -277,12 +303,13 @@ class SyslogReceiver:
                     logger.debug("receiver.timeout", client_ip=client_ip)
                     break
                 except asyncio.LimitOverrunError:
-                    print(f"[{proto_label}] ✗ Line too long from {client_ip} (max {MAX_SYSLOG_LINE}B), skipping")
+                    # HIGH-02: Disconnect abuser instead of trying to consume
+                    # (prevents infinite loop if attacker sends endless data without newline)
+                    print(f"[{proto_label}] ✗ Line too long from {client_ip} (>{MAX_SYSLOG_LINE}B), disconnecting")
                     logger.warning("receiver.line_too_long",
                                     client_ip=client_ip,
                                     limit=MAX_SYSLOG_LINE)
-                    await reader.readline()  # consume the rest
-                    continue
+                    break
 
                 if not data:
                     print(f"[{proto_label}] Connection closed by {client_ip}")
@@ -291,10 +318,9 @@ class SyslogReceiver:
                 message = data.decode("utf-8", errors="replace").strip()
                 if message:
                     self._stats["messages_received"] += 1
-                    print(f"[{proto_label}] Message from {client_ip}: {message[:200]}")
+                    print(f"[{proto_label}] Message from {client_ip} ({len(message)} bytes)")
                     try:
                         await self.message_handler(message, client_ip)
-                        print(f"[{proto_label}] ✓ Message from {client_ip} processed")
                     except Exception as e:
                         print(f"[{proto_label}] ✗ Handler FAILED for {client_ip}: {e}")
                         logger.error("receiver.handler_error",

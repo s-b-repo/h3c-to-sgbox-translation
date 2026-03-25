@@ -33,6 +33,9 @@ This covers virtually every public CA, so the translator can verify SGBox's TLS 
 >     > /etc/h3c-translator/certs/ca-bundle.pem
 > ```
 
+> [!NOTE]
+> If SGBox is using a self-signed or private-CA certificate, you must upload a custom certificate to SGBox and configure the translator to trust it. See the full guide: [Uploading a Custom TLS Certificate to SGBox](SGBox-Integration#4-uploading-a-custom-tls-certificate-to-sgbox-)
+
 ---
 
 ## 2. At-Rest GPG Encryption (SGBox Compatible)

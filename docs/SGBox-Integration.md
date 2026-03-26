@@ -166,7 +166,7 @@ At each step, if files already exist, you will be prompted to **[O]verwrite** or
 <summary><strong>Manual alternative (if not using the script)</strong></summary>
 
 ```bash
-# Generate a self-signed cert (testing only)
+# Generate a key + self-signed cert valid for 1 year
 openssl req -x509 -newkey rsa:4096 -nodes \
   -keyout sgbox.key -out sgbox.crt -days 365 \
   -subj "/CN=sgbox.local/O=MyOrg"

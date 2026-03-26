@@ -246,6 +246,9 @@ class SGBoxEncryption:
             basename = Path(input_path).name
             output_path = os.path.join(self._encrypted_log_dir, f"{basename}.gpg")
 
+        # HIGH-09: Block path traversal
+        self._validate_path(output_path)
+
         print(f"[ENCRYPTION] Encrypting file: {input_path} → {output_path}")
 
         loop = asyncio.get_running_loop()
@@ -300,7 +303,10 @@ class SGBoxEncryption:
             case None:
                 output_path = input_path + ".decrypted"
             case _:
-                pass  # Use provided output_path
+                pass
+
+        # HIGH-09: Block path traversal
+        self._validate_path(output_path)
 
         print(f"[ENCRYPTION] Decrypting file: {input_path} → {output_path}")
 
@@ -350,6 +356,15 @@ class SGBoxEncryption:
         keys = self._gpg.list_keys()
         print(f"[ENCRYPTION] Found {len(keys)} keys in keyring")
         return keys
+
+    def _validate_path(self, path: str) -> None:
+        """HIGH-09: Validate path is within the encrypted log directory."""
+        real = os.path.realpath(path)
+        allowed = os.path.realpath(self._encrypted_log_dir)
+        if not real.startswith(allowed + os.sep) and real != allowed:
+            raise ValueError(
+                f"Path traversal blocked: {path} resolves outside {self._encrypted_log_dir}"
+            )
 
     @property
     def is_enabled(self) -> bool:

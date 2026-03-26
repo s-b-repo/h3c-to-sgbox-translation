@@ -57,6 +57,8 @@ class SyslogOutputServer:
             "messages_sent": 0,
             "messages_dropped": 0,
         }
+        # M4: Lock for thread-safe stats updates
+        self._stats_lock = asyncio.Lock()
 
         print(f"[OUTPUT] Initialized")
         print(f"[OUTPUT]   Bind: {self._bind}:{self._port}")
@@ -118,7 +120,8 @@ class SyslogOutputServer:
 
         # HIGH-03: IP whitelist check
         if not self._is_ip_allowed(client_ip):
-            self._stats["collectors_rejected_ip"] += 1
+            async with self._stats_lock:  # M4
+                self._stats["collectors_rejected_ip"] += 1
             print(f"[OUTPUT] ✗ Collector REJECTED — IP {client_ip} not in whitelist")
             logger.warning("output.collector_ip_rejected", client_ip=client_ip)
             writer.close()
@@ -133,8 +136,9 @@ class SyslogOutputServer:
 
         async with self._clients_lock:
             self._clients[client_id] = writer
-        self._stats["collectors_connected"] += 1
-        self._stats["collectors_total"] += 1
+        async with self._stats_lock:  # M4
+            self._stats["collectors_connected"] += 1
+            self._stats["collectors_total"] += 1
 
         print(f"[OUTPUT] Active collectors: {self._stats['collectors_connected']}")
 
@@ -150,7 +154,8 @@ class SyslogOutputServer:
         finally:
             async with self._clients_lock:
                 self._clients.pop(client_id, None)
-            self._stats["collectors_connected"] -= 1
+            async with self._stats_lock:  # M4
+                self._stats["collectors_connected"] -= 1
             await self._safe_close_writer(writer)
             print(f"[OUTPUT] Collector {client_id} removed. Active: {self._stats['collectors_connected']}")
             logger.info("output.collector_disconnected", client_id=client_id)
@@ -180,19 +185,28 @@ class SyslogOutputServer:
 
         print(f"[OUTPUT] Broadcasting to {len(clients_snapshot)} collector(s): {message[:100]}...")
 
-        dead_clients = []
-        for client_id, writer in clients_snapshot.items():
+        # M3: Parallel drain — one slow collector doesn't block others
+        async def _send_to_client(client_id: str, writer: asyncio.StreamWriter):
             try:
                 writer.write(data)
                 await writer.drain()
-                self._stats["messages_sent"] += 1
+                async with self._stats_lock:  # M4
+                    self._stats["messages_sent"] += 1
                 print(f"[OUTPUT] ✓ Sent to {client_id}")
+                return None  # Success
             except Exception as e:
-                self._stats["messages_dropped"] += 1
-                dead_clients.append(client_id)
+                async with self._stats_lock:  # M4
+                    self._stats["messages_dropped"] += 1
                 print(f"[OUTPUT] ✗ FAILED to send to {client_id}: {e}")
+                return client_id  # Mark as dead
+
+        results = await asyncio.gather(
+            *[_send_to_client(cid, w) for cid, w in clients_snapshot.items()],
+            return_exceptions=True,
+        )
 
         # Remove dead connections
+        dead_clients = [r for r in results if isinstance(r, str)]
         if dead_clients:
             async with self._clients_lock:
                 for client_id in dead_clients:

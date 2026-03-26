@@ -11,6 +11,7 @@ Output format:
 Dependencies: structlog
 """
 
+import re
 import threading
 
 import structlog
@@ -48,7 +49,28 @@ EXTENDED_FIELDS = [
     "end_time",
     "vlan_id",
     "vni",
+    # H2: New parser fields from FILTER/SESSION/policy modules
+    "src_zone",
+    "dst_zone",
+    "policy_name",
+    "user",
+    "fw_action",
+    "hit_count",
+    "match_count",
 ]
+
+# M2: PRI calculation constants — built once at module level
+_SYSLOG_FACILITIES = {
+    "kern": 0, "user": 1, "mail": 2, "daemon": 3,
+    "auth": 4, "syslog": 5, "lpr": 6, "news": 7,
+    "uucp": 8, "cron": 9, "authpriv": 10, "ftp": 11,
+    "local0": 16, "local1": 17, "local2": 18, "local3": 19,
+    "local4": 20, "local5": 21, "local6": 22, "local7": 23,
+}
+_SYSLOG_SEVERITIES = {
+    "emerg": 0, "alert": 1, "crit": 2, "err": 3,
+    "warning": 4, "notice": 5, "info": 6, "debug": 7,
+}
 
 
 class SGBoxFormatter:
@@ -158,7 +180,8 @@ class SGBoxFormatter:
 
         pri = self._calculate_pri(facility, severity)
         hostname = parsed.get("hostname", "h3c-firewall")
-        timestamp = parsed.get("_csv_timestamp", "")
+        # H3: Use _csv_timestamp, fall back to _syslog_timestamp
+        timestamp = parsed.get("_csv_timestamp", "") or parsed.get("_syslog_timestamp", "")
 
         match (self.include_timestamp, bool(timestamp)):
             case (True, True):
@@ -186,8 +209,7 @@ class SGBoxFormatter:
         Sanitize a field value for safe inclusion in key=value output.
         Strips non-printable chars, ANSI escapes, and log-forging characters.
         """
-        # LOW-02: Strip non-printable ASCII, null bytes, ANSI escape codes
-        import re
+        # H1: re is now imported at module level (no per-call import)
         sanitized = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value)
         # Remove ANSI escape sequences
         sanitized = re.sub(r'\x1b\[[0-9;]*[a-zA-Z]', '', sanitized)
@@ -203,19 +225,9 @@ class SGBoxFormatter:
     @staticmethod
     def _calculate_pri(facility: str, severity: str) -> int:
         """Calculate syslog PRI value from facility and severity names."""
-        facilities = {
-            "kern": 0, "user": 1, "mail": 2, "daemon": 3,
-            "auth": 4, "syslog": 5, "lpr": 6, "news": 7,
-            "uucp": 8, "cron": 9, "authpriv": 10, "ftp": 11,
-            "local0": 16, "local1": 17, "local2": 18, "local3": 19,
-            "local4": 20, "local5": 21, "local6": 22, "local7": 23,
-        }
-        severities = {
-            "emerg": 0, "alert": 1, "crit": 2, "err": 3,
-            "warning": 4, "notice": 5, "info": 6, "debug": 7,
-        }
-        fac = facilities.get(facility.lower(), 16)
-        sev = severities.get(severity.lower(), 6)
+        # M2: Uses module-level constants instead of rebuilding dicts per call
+        fac = _SYSLOG_FACILITIES.get(facility.lower(), 16)
+        sev = _SYSLOG_SEVERITIES.get(severity.lower(), 6)
         pri = (fac * 8) + sev
         print(f"[FORMATTER] PRI={pri} (facility={facility}/{fac}, severity={severity}/{sev})")
         return pri

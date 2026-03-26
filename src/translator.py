@@ -325,12 +325,28 @@ async def run_server(config: dict):
 
     # ── Choose output mode ─────────────────────────────────────────
     output_server = None
-    forwarder = None
+    forwarders: list[SyslogForwarder] = []  # Multi-destination push support
 
     match mode:
         case "push":
-            print(f"[SERVER] Mode=push → initializing SyslogForwarder")
-            forwarder = SyslogForwarder(config)
+            # Support comma-separated hosts for multi-destination push
+            raw_hosts = sgbox_config.get("host", "")
+            hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]
+            if not hosts:
+                print(f"[SERVER] ✗ Push mode but no hosts configured!")
+                hosts = ["127.0.0.1"]
+
+            for host in hosts:
+                # Create per-destination config override
+                dest_config = dict(config)
+                dest_sgbox = dict(sgbox_config)
+                dest_sgbox["host"] = host
+                dest_config["sgbox"] = dest_sgbox
+                fwd = SyslogForwarder(dest_config)
+                forwarders.append(fwd)
+                print(f"[SERVER] ✓ Forwarder created for {host}:{dest_sgbox.get('port', '6154')}")
+
+            print(f"[SERVER] {len(forwarders)} push destination(s) configured")
         case "pull":
             print(f"[SERVER] Mode=pull → initializing SyslogOutputServer")
             output_server = SyslogOutputServer(config)
@@ -338,27 +354,41 @@ async def run_server(config: dict):
             print(f"[SERVER] ✗ Unknown mode '{mode}', defaulting to pull")
             output_server = SyslogOutputServer(config)
 
+    # Concurrency limiter for parallel message processing
+    _pipeline_semaphore = asyncio.Semaphore(1000)
+
     # ── Message handler ────────────────────────────────────────────
     async def handle_message(message: str, client_ip: str):
-        """Parse, format, encrypt (if enabled), and send a single H3C log message."""
-        print(f"[PIPELINE] Processing message from {client_ip}: {message[:120]}...")
+        """
+        Parse, format, encrypt, and fan-out a single H3C log message.
 
-        parsed = parser.parse(message)
-        if not parsed:
-            print(f"[PIPELINE] ✗ Parser returned None — message could not be parsed")
-            return
+        Runs as a concurrent task — multiple sources processed in parallel.
+        A semaphore caps in-flight work to prevent memory exhaustion.
+        """
+        async with _pipeline_semaphore:
+            print(f"[PIPELINE] Processing message from {client_ip}: {message[:120]}...")
 
-        print(f"[PIPELINE] ✓ Parsed: proto={parsed.get('proto', '?')} "
-              f"src={parsed.get('src', '?')} dst={parsed.get('dst', '?')} "
-              f"action={parsed.get('action', '?')}")
+            # CPU-bound parsing runs in the calling coroutine (offloaded by
+            # the receiver/API to a thread pool when needed)
+            parsed = parser.parse(message)
+            if not parsed:
+                print(f"[PIPELINE] ✗ Parser returned None — message could not be parsed")
+                return
 
-        syslog_msg = formatter.format_syslog(
-            parsed,
-            facility=sgbox_config.get("facility", "local0"),
-            severity=sgbox_config.get("severity", "info"),
-        )
+            print(f"[PIPELINE] ✓ Parsed: proto={parsed.get('proto', '?')} "
+                  f"src={parsed.get('src', '?')} dst={parsed.get('dst', '?')} "
+                  f"action={parsed.get('action', '?')}")
 
-        if syslog_msg:
+            syslog_msg = formatter.format_syslog(
+                parsed,
+                facility=sgbox_config.get("facility", "local0"),
+                severity=sgbox_config.get("severity", "info"),
+            )
+
+            if not syslog_msg:
+                print(f"[PIPELINE] ✗ Formatter returned None — missing required fields")
+                return
+
             print(f"[PIPELINE] ✓ Formatted syslog: {syslog_msg[:120]}...")
 
             # Encrypt at rest if SGBox encryption is enabled
@@ -367,16 +397,24 @@ async def run_server(config: dict):
                 syslog_msg = await encryption.encrypt(syslog_msg)
                 print(f"[PIPELINE] ✓ Encrypted ({len(syslog_msg)} bytes)")
 
+            # Fan-out: send to ALL destinations in parallel
             if output_server:
                 print(f"[PIPELINE] Sending to output server (pull mode)...")
                 await output_server.send(syslog_msg)
-            elif forwarder:
-                print(f"[PIPELINE] Forwarding to SGBox (push mode)...")
-                await forwarder.send(syslog_msg)
+            elif forwarders:
+                if len(forwarders) == 1:
+                    await forwarders[0].send(syslog_msg)
+                else:
+                    # Parallel push to all destinations
+                    results = await asyncio.gather(
+                        *[fwd.send(syslog_msg) for fwd in forwarders],
+                        return_exceptions=True,
+                    )
+                    for i, result in enumerate(results):
+                        if isinstance(result, Exception):
+                            print(f"[PIPELINE] ✗ Forwarder {i} delivery failed: {result}")
 
             print(f"[PIPELINE] ✓ Message delivered successfully")
-        else:
-            print(f"[PIPELINE] ✗ Formatter returned None — missing required fields")
 
     # ── Start syslog receiver ──────────────────────────────────────
     print(f"\n[SERVER] Starting syslog receiver...")
@@ -390,26 +428,29 @@ async def run_server(config: dict):
                 print(f"\n[SERVER] Starting output server (pull mode)...")
                 await output_server.start()
         case "push":
-            if forwarder:
-                async def _init_forwarder():
-                    try:
-                        await forwarder.connect()
-                        print(f"[SERVER] ✓ Forwarder connected to SGBox")
-                    except Exception as e:
-                        print(f"[SERVER] ✗ Forwarder initial connect FAILED: {e}")
+            # Connect ALL forwarders in parallel
+            async def _init_forwarders():
+                connect_tasks = []
+                for fwd in forwarders:
+                    connect_tasks.append(fwd.connect())
+                results = await asyncio.gather(*connect_tasks, return_exceptions=True)
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        print(f"[SERVER] ✗ Forwarder {i} initial connect FAILED: {result}")
                         print(f"[SERVER]   Will retry on first message")
                         logger.error("forwarder.initial_connect_failed",
-                                      error=str(e),
-                                      msg="Will retry on first message")
-                asyncio.create_task(_init_forwarder())
+                                      index=i, error=str(result))
+                    else:
+                        print(f"[SERVER] ✓ Forwarder {i} connected")
+            asyncio.create_task(_init_forwarders())
 
     # ── Start async API server ─────────────────────────────────────
     def get_stats():
         stats = {"receiver": receiver.stats}
         if output_server:
             stats["output_server"] = output_server.stats
-        if forwarder:
-            stats["forwarder"] = forwarder.stats
+        for i, fwd in enumerate(forwarders):
+            stats[f"forwarder_{i}"] = fwd.stats
         return stats
 
     print(f"\n[SERVER] Starting API server...")
@@ -460,12 +501,14 @@ async def run_server(config: dict):
     # ── Cleanup ────────────────────────────────────────────────────
     print(f"\n[SERVER] Shutting down...")
     logger.info("translator.shutting_down")
+    # Flush remaining failed log buffer
+    parser.flush_remaining()
     await receiver.stop()
     await api.stop()
     if output_server:
         await output_server.stop()
-    if forwarder:
-        await forwarder.close()
+    for fwd in forwarders:
+        await fwd.close()
 
     # Final stats
     print(f"\n{'='*60}")

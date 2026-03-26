@@ -39,13 +39,17 @@ logger = structlog.get_logger(__name__)
 MAX_BULK_LINES = 1000          # cap bulk array size
 MAX_BODY_SIZE = 10 * 1024 * 1024  # 10 MB
 MAX_SINGLE_BODY = 64 * 1024    # 64 KB for single translate
-RATE_LIMIT_WINDOW = 60         # seconds
-RATE_LIMIT_MAX_REQUESTS = 120  # per IP per window
+RATE_LIMIT_WINDOW = 1          # seconds (per-second rate cap)
+RATE_LIMIT_MAX_REQUESTS = 200  # per IP per window (200 req/s)
 RATE_LIMIT_MAX_IPS = 10_000    # max tracked IPs (OOM prevention)
 
 
 class _RateLimiter:
-    """Async-safe per-IP sliding-window rate limiter with OOM protection."""
+    """Async-safe per-IP sliding-window rate limiter with OOM protection.
+
+    C3: Uses fixed-size (count, window_start) tuples instead of growing
+    timestamp lists to prevent memory exhaustion under burst traffic.
+    """
 
     def __init__(self, window: int = RATE_LIMIT_WINDOW,
                  max_requests: int = RATE_LIMIT_MAX_REQUESTS,
@@ -54,7 +58,8 @@ class _RateLimiter:
         self._max = max_requests
         self._max_ips = max_ips
         self._lock = asyncio.Lock()
-        self._hits: dict[str, list[float]] = {}
+        # C3: Fixed-size tuple (count, window_start) per IP
+        self._hits: dict[str, tuple[int, float]] = {}
 
     async def is_allowed(self, client_ip: str) -> bool:
         now = time.monotonic()
@@ -63,21 +68,25 @@ class _RateLimiter:
             if len(self._hits) > self._max_ips:
                 self._evict_stale(now)
 
-            timestamps = self._hits.get(client_ip, [])
-            timestamps = [t for t in timestamps if now - t < self._window]
-            if len(timestamps) >= self._max:
-                self._hits[client_ip] = timestamps
-                print(f"[API] ✗ Rate limit hit for {client_ip} ({len(timestamps)}/{self._max})")
+            entry = self._hits.get(client_ip)
+            if entry is None or (now - entry[1]) >= self._window:
+                # New window for this IP
+                self._hits[client_ip] = (1, now)
+                return True
+
+            count, window_start = entry
+            if count >= self._max:
+                print(f"[API] ✗ Rate limit hit for {client_ip} ({count}/{self._max})")
                 return False
-            timestamps.append(now)
-            self._hits[client_ip] = timestamps
+
+            self._hits[client_ip] = (count + 1, window_start)
             return True
 
     def _evict_stale(self, now: float):
-        """Remove IPs whose timestamps have all expired (called under lock)."""
+        """Remove IPs whose windows have expired (called under lock)."""
         stale_keys = [
-            ip for ip, ts in self._hits.items()
-            if not ts or all(now - t >= self._window for t in ts)
+            ip for ip, (_, ws) in self._hits.items()
+            if (now - ws) >= self._window
         ]
         for key in stale_keys:
             del self._hits[key]
@@ -283,10 +292,18 @@ class APIServer:
         """Validate API key from X-API-Key header (timing-safe)."""
         if self._api_key:
             provided = request.headers.get("X-API-Key", "")
-            # MED-01: Always call compare_digest to prevent timing side-channel
-            # Pad empty input to same length to avoid short-circuit leak
+            # LOW-04: Short-circuit if no key provided
+            if not provided:
+                client_ip = self._get_client_ip(request)
+                print(f"[API] ✗ AUTH FAILED from {client_ip} on {request.method} {request.path}")
+                logger.warning("api.auth_failure", client_ip=client_ip)
+                raise web.HTTPUnauthorized(
+                    text='{"error": "Unauthorized"}',
+                    content_type="application/json",
+                )
+            # MED-01: timing-safe comparison
             if not hmac.compare_digest(
-                provided.encode("utf-8") if provided else b"\x00",
+                provided.encode("utf-8"),
                 self._api_key.encode("utf-8"),
             ):
                 client_ip = self._get_client_ip(request)
@@ -323,8 +340,7 @@ class APIServer:
         response.headers["Content-Security-Policy"] = "default-src 'none'"
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate"
         response.headers["Pragma"] = "no-cache"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key"
+        # MED-07: No CORS headers — machine-to-machine API doesn't need them
         return response
 
     # ── Route handlers ─────────────────────────────────────────────
@@ -447,6 +463,13 @@ class APIServer:
             )
 
         lines = data.get("lines", [])
+        # HIGH-06: Type validation — reject non-list types
+        if not isinstance(lines, list):
+            print(f"[API] ✗ 'lines' is not an array, type={type(lines).__name__}")
+            raise web.HTTPBadRequest(
+                text='{"error": "lines must be an array"}',
+                content_type="application/json",
+            )
         if not lines:
             print(f"[API] ✗ Missing 'lines' array")
             raise web.HTTPBadRequest(

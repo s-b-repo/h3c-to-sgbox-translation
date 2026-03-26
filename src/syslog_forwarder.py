@@ -80,6 +80,7 @@ class SyslogForwarder:
 
     @property
     def stats(self) -> dict[str, int]:
+        # LOW-05: Return a copy (lock is asyncio.Lock, can't await in property)
         return self._stats.copy()
 
     async def connect(self):
@@ -183,6 +184,7 @@ class SyslogForwarder:
             outgoing = message
 
         data = (outgoing + "\n").encode("utf-8")
+        # MED-05: Never log the full outgoing (contains API key)
         print(f"[FORWARDER] Sending {len(data)}B via {self.protocol.upper()}")
 
         match self.protocol:
@@ -198,7 +200,7 @@ class SyslogForwarder:
                 print(f"[FORWARDER] UDP transport not ready, reconnecting...")
                 await self._connect_udp()
 
-            self._transport.sendto(data)
+            self._transport.sendto(data, (self.host, self.port))  # H5: explicit target
             async with self._stats_lock:
                 self._stats["messages_sent"] += 1
             print(f"[FORWARDER] ✓ UDP message sent ({len(data)}B)")
@@ -216,10 +218,12 @@ class SyslogForwarder:
                 print(f"[FORWARDER] Not connected, attempting reconnect...")
                 try:
                     await self._connect_tcp()
-                    self._stats["reconnections"] += 1
+                    async with self._stats_lock:  # H4: consistent locking
+                        self._stats["reconnections"] += 1
                     print(f"[FORWARDER] ✓ Reconnected (total reconnections: {self._stats['reconnections']})")
                 except Exception as e:
-                    self._stats["messages_failed"] += 1
+                    async with self._stats_lock:  # H4: consistent locking
+                        self._stats["messages_failed"] += 1
                     print(f"[FORWARDER] ✗ Reconnect FAILED: {e} — message DROPPED")
                     return
 
@@ -244,7 +248,7 @@ class SyslogForwarder:
                     await self._connect_tcp()
                     self._writer.write(data)
                     await self._writer.drain()
-                    async with self._stats_lock:
+                    async with self._stats_lock:  # H4: consistent locking
                         self._stats["messages_sent"] += 1
                         self._stats["messages_failed"] -= 1
                         self._stats["reconnections"] += 1

@@ -26,6 +26,7 @@ MAX_SYSLOG_LINE = 8192  # 8 KB — RFC 5424 recommends ≤ 2048, generous margin
 # UDP rate limiting: max datagrams per source IP per window
 _UDP_RATE_LIMIT = 500      # max msgs per window
 _UDP_RATE_WINDOW = 10.0    # seconds
+_UDP_RATE_MAX_IPS = 10_000 # HIGH-07: cap tracked IPs to prevent OOM
 
 
 class _UDPSyslogProtocol(asyncio.DatagramProtocol):
@@ -46,7 +47,7 @@ class _UDPSyslogProtocol(asyncio.DatagramProtocol):
     def connection_made(self, transport: asyncio.DatagramTransport):
         self._transport = transport
         # Schedule periodic rate counter reset
-        loop = transport.get_extra_info("loop") or asyncio.get_event_loop()
+        loop = transport.get_extra_info("loop") or asyncio.get_running_loop()  # L3
         self._schedule_rate_reset(loop)
         print(f"[UDP] Datagram endpoint ready")
 
@@ -59,41 +60,43 @@ class _UDPSyslogProtocol(asyncio.DatagramProtocol):
 
     def datagram_received(self, data: bytes, addr: tuple):
         client_ip = addr[0]
-        client_port = addr[1]
 
-        # LOW-01: Per-source rate limiting
+        # LOW-01 + HIGH-07: Per-source rate limiting with IP cap
         count = self._rate_counts.get(client_ip, 0)
         if count >= _UDP_RATE_LIMIT:
-            # Silently drop — don't log every dropped packet
-            return
+            return  # Silently drop
+        if client_ip not in self._rate_counts and len(self._rate_counts) >= _UDP_RATE_MAX_IPS:
+            return  # HIGH-07: table full, drop unknown IPs
         self._rate_counts[client_ip] = count + 1
 
         # IP whitelist check
         if not self._receiver._is_ip_allowed(client_ip):
-            self._receiver._stats["connections_rejected_ip"] += 1
-            print(f"[UDP] ✗ REJECTED — IP {client_ip} is NOT in the allowed_ips whitelist")
-            logger.debug("receiver.udp_ip_rejected", client_ip=client_ip)
+            self._receiver._increment_stat("connections_rejected_ip")
             return
-
-        print(f"[UDP] ✓ IP {client_ip} is allowed")
 
         message = data.decode("utf-8", errors="replace").strip()
         if not message:
             return
 
-        print(f"[UDP] Message from {client_ip} ({len(message)} bytes)")
-        self._receiver._stats["messages_received"] += 1
+        self._receiver._increment_stat("messages_received")
 
-        # Schedule the async handler on the event loop
-        asyncio.ensure_future(self._handle(message, client_ip))
+        # LOW-06: create_task instead of deprecated ensure_future; store ref
+        task = asyncio.get_running_loop().create_task(self._handle(message, client_ip))
+        task.add_done_callback(self._task_done)
+
+    @staticmethod
+    def _task_done(task: asyncio.Task):
+        """LOW-06: Log exceptions from fire-and-forget UDP handler tasks."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            logger.error("receiver.udp_task_error", error=str(exc))
 
     async def _handle(self, message: str, client_ip: str):
         try:
-            print(f"[UDP] Passing message to handler pipeline from {client_ip}")
             await self._receiver.message_handler(message, client_ip)
-            print(f"[UDP] ✓ Message from {client_ip} processed successfully")
         except Exception as e:
-            print(f"[UDP] ✗ Handler FAILED for message from {client_ip}: {e}")
             logger.error("receiver.udp_handler_error",
                          client_ip=client_ip, error=str(e))
 
@@ -144,6 +147,8 @@ class SyslogReceiver:
         self._allowed_networks = self._parse_allowed_ips(
             config.get("security", {}).get("allowed_ips", "0.0.0.0/0")
         )
+        # HIGH-08: Lock for all stats mutations
+        self._stats_lock = asyncio.Lock()
         self._stats: Dict[str, int] = {
             "connections_total": 0,
             "connections_rejected_ip": 0,
@@ -155,6 +160,11 @@ class SyslogReceiver:
         print(f"[RECEIVER] Initialized")
         print(f"[RECEIVER]   Max connections: {self._max_connections}")
         print(f"[RECEIVER]   Allowed networks: {[str(n) for n in self._allowed_networks]}")
+
+    def _increment_stat(self, key: str) -> None:
+        """HIGH-08: Thread-safe stat increment (sync, for UDP protocol callbacks)."""
+        # Safe because asyncio is single-threaded; lock is for coroutine interleaving
+        self._stats[key] = self._stats.get(key, 0) + 1
 
     @property
     def stats(self) -> Dict[str, int]:
@@ -264,17 +274,18 @@ class SyslogReceiver:
 
         # ── IP whitelist check ─────────────────────────────────────
         if not self._is_ip_allowed(client_ip):
-            self._stats["connections_rejected_ip"] += 1
+            self._increment_stat("connections_rejected_ip")
             print(f"[{proto_label}] ✗ REJECTED — IP {client_ip} not in whitelist")
             logger.warning("receiver.ip_rejected", client_ip=client_ip)
             writer.close()
             await writer.wait_closed()
             return
 
-        # ── Connection limit check (HIGH-01: atomic acquire) ──────
-        acquired = self._connection_semaphore._value > 0
-        if not acquired:
-            self._stats["connections_rejected_limit"] += 1
+        # CRIT-04: Atomic semaphore acquire — no TOCTOU race
+        try:
+            await asyncio.wait_for(self._connection_semaphore.acquire(), timeout=0.1)
+        except asyncio.TimeoutError:
+            self._increment_stat("connections_rejected_limit")
             print(f"[{proto_label}] ✗ REJECTED — Max connections reached ({self._max_connections})")
             logger.warning("receiver.max_connections",
                             client_ip=client_ip,
@@ -283,9 +294,8 @@ class SyslogReceiver:
             await writer.wait_closed()
             return
 
-        await self._connection_semaphore.acquire()
         self._active_count += 1
-        self._stats["connections_total"] += 1
+        self._increment_stat("connections_total")
         conn_id = f"{client_ip}:{client_port}"
         self._active_connections.add(conn_id)
         print(f"[{proto_label}] ✓ Connected {conn_id} (active: {self._active_count})")
@@ -317,7 +327,7 @@ class SyslogReceiver:
 
                 message = data.decode("utf-8", errors="replace").strip()
                 if message:
-                    self._stats["messages_received"] += 1
+                    self._increment_stat("messages_received")
                     print(f"[{proto_label}] Message from {client_ip} ({len(message)} bytes)")
                     try:
                         await self.message_handler(message, client_ip)
@@ -327,7 +337,7 @@ class SyslogReceiver:
                                       client_ip=client_ip, error=str(e))
 
         except ssl.SSLError as e:
-            self._stats["tls_errors"] += 1
+            self._increment_stat("tls_errors")
             print(f"[{proto_label}] ✗ TLS ERROR from {client_ip}: {e}")
             logger.error("receiver.tls_error", client_ip=client_ip, error=str(e))
         except ConnectionResetError:

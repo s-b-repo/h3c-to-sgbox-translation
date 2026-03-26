@@ -48,10 +48,11 @@ Controls how translated logs are delivered to SGBox.
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `mode` | `push` | **`push`** (recommended) — translator forwards logs to SGBox over TLS. **`pull`** — SGBox collector connects to translator's `output_port` |
-| `host` | `192.168.1.100` | SGBox SIEM server address (push mode). **Change this to your SGBox IP.** |
+| `host` | — | SGBox SIEM IP address (push mode). **Must be an external/routable address.** Supports multiple destinations: `host = 10.10.0.52,10.10.0.53` for parallel fan-out |
 | `port` | `6154` | SGBox syslog TLS port (push mode) |
 | `output_port` | `1514` | TCP port SGBox collectors connect to (pull mode only) |
 | `protocol` | `tls` | Output protocol: `tls` (encrypted, recommended), `tcp`, or `udp` |
+| `sgbox_api_key` | — | SGBox API key for log ingestion authentication. Obtain from **SGBox Console → SCM → Configuration → API Keys** |
 | `facility` | `local0` | Syslog facility header (`local0`–`local7`, `user`, `daemon`, etc.) |
 | `severity` | `info` | Syslog severity header (`emerg`, `alert`, `crit`, `err`, `warning`, `notice`, `info`, `debug`) |
 
@@ -59,13 +60,18 @@ Controls how translated logs are delivered to SGBox.
 
 ## `[output]`
 
-Controls how parsed H3C fields are formatted into output text.
+Controls how parsed H3C fields are formatted into output text. SGBox accepts CEF natively — no custom pattern needed.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `format` | `extended` | **`core`** — minimal fields (`proto`, `src`, `dst`, `sport`, `dport`, `action`). **`extended`** — all fields including NAT, app, hostname, category |
-| `include_hostname` | `true` | Appends `hostname=<DeviceName>` from H3C log headers |
-| `include_timestamp` | `true` | Appends the parsed session start timestamp |
+| `format` | `cef` | **`cef`** — CEF (Common Event Format). SGBox has built-in normalization, recommended. **`extended`** — key=value, all fields (requires custom SGBox pattern). **`core`** — key=value, minimal fields only |
+| `include_hostname` | `true` | Include `shost=<DeviceName>` in CEF extension (or `hostname=` in key=value mode) |
+| `include_timestamp` | `true` | Include the original session timestamp in the syslog envelope |
+
+**CEF output example:**
+```
+<134>Mar 26 15:00:00 FW-01 CEF:0|H3C|Comware|7.0|SESSION_CREATED|Session Permitted|3|src=10.1.1.10 dst=8.8.8.8 spt=52314 dpt=443 proto=TCP act=permit app=HTTPS shost=FW-01
+```
 
 ## `[encryption]`
 

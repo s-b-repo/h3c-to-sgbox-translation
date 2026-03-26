@@ -111,8 +111,8 @@ ISO_TS_RE = re.compile(
 # RFC 5424 version prefix (just "1 " after PRI)
 RFC5424_VER_RE = re.compile(r'^(\d)\s+')
 
-# H3C marker: %%NN  (1–4 digits)
-H3C_MARKER_RE = re.compile(r'%%(\d{1,4})\s+')
+# H3C marker: %%NN  (1–4 digits, space before module is optional)
+H3C_MARKER_RE = re.compile(r'%%(\d{1,4})\s*')
 
 # Original syslog header (works when marker is already located)
 # Matches: IP FACILITY HOSTNAME %%N [VsysId:N] MODULE:
@@ -120,7 +120,7 @@ SYSLOG_HEADER_RE = re.compile(
     r'^(?P<src_ip>\d+\.\d+\.\d+\.\d+)\s+'
     r'(?P<facility>\S+)\s+'
     r'(?P<hostname>\S+)\s+'
-    r'%%\d{1,4}\s+'
+    r'%%\d{1,4}\s*'
     r'(?:VsysId:\d+\s+)?'
     r'(?P<module>\S+):\s*'
 )
@@ -128,7 +128,7 @@ SYSLOG_HEADER_RE = re.compile(
 # Relaxed header: HOSTNAME %%N [VsysId:N] MODULE:  (no IP, no facility)
 RELAXED_HEADER_RE = re.compile(
     r'^(?P<hostname>\S+)\s+'
-    r'%%\d{1,4}\s+'
+    r'%%\d{1,4}\s*'
     r'(?:VsysId:\d+\s+)?'
     r'(?P<module>\S+):\s*'
 )
@@ -172,7 +172,7 @@ class H3CLogParser:
     # C2: Batch failed lines in memory, flush every N lines
     _FAILED_FLUSH_INTERVAL = 100
 
-    def __init__(self, failed_log_dir: str = "/var/log/h3c-translator/failed"):
+    def __init__(self, failed_log_dir: str = ""):
         self._field_map = FIELD_MAP.copy()
         self._stats_lock = threading.Lock()
         self._stats = {
@@ -182,6 +182,10 @@ class H3CLogParser:
         }
 
         # ── Failed-to-parse log directory ──────────────────────────
+        # BUG-09: Default to project-relative path, not /var/log/ (needs root)
+        if not failed_log_dir:
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            failed_log_dir = os.path.join(project_root, "logs", "failed")
         self._failed_log_dir = failed_log_dir
         self._failed_buffer: list[str] = []  # C2: in-memory batch buffer
         self._failed_buffer_lock = threading.Lock()
@@ -335,6 +339,18 @@ class H3CLogParser:
                     print(f"[PARSER]   {mapped_key}={raw_value}")
 
         if fields_found == 0:
+            # ── Phase 5b: System log fallback ──────────────────────────
+            # H3C system logs (WEB, SHELL, CONFIGURATION, etc.) use free-text
+            # format instead of Key(NNN)=value. Extract what we can.
+            module_raw = result.get("_module", "")
+            sys_parsed = self._parse_system_log(module_raw, payload, result)
+            if sys_parsed:
+                result.update(sys_parsed)
+                fields_found = len([k for k in sys_parsed if not k.startswith("_")])
+                print(f"[PARSER] ✓ System log: module={module_raw} "
+                      f"({fields_found} fields extracted)")
+
+        if fields_found == 0:
             with self._stats_lock:
                 self._stats["failed"] += 1
             print(f"[PARSER] ✗ No recognized fields found in: {line[:120]}")
@@ -343,14 +359,16 @@ class H3CLogParser:
             return None
 
         # ── Phase 6: Derive action from Event or Action field ──────
-        event_raw = result.get("event", "")
-        fw_action = result.get("fw_action", "")
-        if fw_action:
-            # Direct action field takes precedence
-            result["action"] = fw_action.lower().strip()
-            print(f"[PARSER] ✓ Direct fw_action={result['action']}")
-        else:
-            result["action"] = self._derive_action(event_raw)
+        # Skip if action was already set by the system log handler (Phase 5b)
+        if "action" not in result:
+            event_raw = result.get("event", "")
+            fw_action = result.get("fw_action", "")
+            if fw_action:
+                # Direct action field takes precedence
+                result["action"] = fw_action.lower().strip()
+                print(f"[PARSER] ✓ Direct fw_action={result['action']}")
+            else:
+                result["action"] = self._derive_action(event_raw)
 
         print(f"[PARSER] ✓ Parsed {fields_found} fields, action={result['action']}")
 
@@ -404,6 +422,156 @@ class H3CLogParser:
             # M1: Save original CSV line context on fallback failure
             self._save_failed_line(csv_line, reason="csv_insufficient_fields")
         return result
+
+    def _parse_system_log(self, module_raw: str, payload: str,
+                           result: dict) -> Optional[Dict[str, str]]:
+        """
+        Parse H3C system logs that use free-text format instead of Key(NNN)=value.
+
+        Handles modules: WEB, SHELL, CONFIGURATION, IFNET, NTP, CFGMAN,
+        SSHS, SNMP, AAA, HA, and any other %%NN MODULE/SEV/MNEMONIC: format.
+
+        Args:
+            module_raw: The MODULE/SEVERITY/MNEMONIC string (e.g. "WEB/5/LOGIN")
+            payload: The free-text message after the MODULE: colon
+            result: The partially-built result dict (may already have hostname, _module)
+
+        Returns:
+            Dict of extracted fields, or None if this isn't a recognized system log.
+        """
+        if not module_raw:
+            return None
+
+        # Parse MODULE/SEVERITY/MNEMONIC structure
+        mod_parts = module_raw.split("/")
+        if len(mod_parts) < 2:
+            return None
+
+        module_name = mod_parts[0].upper()    # e.g. "WEB", "SHELL", "CONFIGURATION"
+        mnemonic = mod_parts[-1] if len(mod_parts) >= 3 else module_name
+
+        out: dict[str, str] = {}
+        out["proto"] = "SYSLOG"               # Synthetic — needed for formatter
+        out["category"] = module_name          # e.g. "WEB", "SHELL"
+        out["event"] = f"{module_raw}: {payload.strip()[:200]}"
+        out["_log_type"] = "system"            # Flag for formatter routing
+
+        payload_stripped = payload.strip()
+
+        # ── Module-specific field extraction ─────────────────────────
+
+        # LOGIN / LOGOUT events: "Username logged in/out from IP"
+        login_match = re.match(
+            r'^(\S+)\s+logged\s+(in|out)\s+from\s+(\d+\.\d+\.\d+\.\d+)',
+            payload_stripped, re.IGNORECASE
+        )
+        if login_match:
+            out["user"] = re.sub(r'[\x00-\x1f\x7f]', '', login_match.group(1))[:128]
+            candidate_ip = login_match.group(3)
+            if self._is_valid_ip(candidate_ip):
+                out["src"] = candidate_ip
+            out["action"] = "permit" if login_match.group(2).lower() == "in" else "close"
+            print(f"[PARSER]   SYS: user={out['user']} src={out.get('src','?')} "
+                  f"login={login_match.group(2)}")
+            return out
+
+        # SHELL_CMD events: "-Line=CON-IPAddr=IP-User=Name; Command is ..."
+        cmd_match = re.match(
+            r'^-Line=(\S*)-IPAddr=(\d+\.\d+\.\d+\.\d+)-User=([^;]+);\s*Command\s+is\s+(.*)',
+            payload_stripped, re.IGNORECASE
+        )
+        if cmd_match:
+            out["user"] = re.sub(r'[\x00-\x1f\x7f]', '', cmd_match.group(3).strip())[:128]
+            candidate_ip = cmd_match.group(2)
+            if self._is_valid_ip(candidate_ip):
+                out["src"] = candidate_ip
+            out["app"] = f"CLI:{cmd_match.group(1) or 'unknown'}"
+            out["action"] = "log"
+            out["_command"] = cmd_match.group(4).strip()[:200]
+            print(f"[PARSER]   SYS: user={out['user']} src={out.get('src','?')} "
+                  f"cmd={out['_command'][:80]}")
+            return out
+
+        # SHELL_CMD variant without dashes: "Line=CON IPAddr=IP User=Name; Command is ..."
+        cmd_match2 = re.match(
+            r'^-?Line=(\S*)\s*-?IPAddr=(\d+\.\d+\.\d+\.\d+)\s*-?User=([^;]+);\s*Command\s+is\s+(.*)',
+            payload_stripped, re.IGNORECASE
+        )
+        if cmd_match2:
+            out["user"] = re.sub(r'[\x00-\x1f\x7f]', '', cmd_match2.group(3).strip())[:128]
+            candidate_ip = cmd_match2.group(2)
+            if self._is_valid_ip(candidate_ip):
+                out["src"] = candidate_ip
+            out["app"] = f"CLI:{cmd_match2.group(1) or 'unknown'}"
+            out["action"] = "log"
+            out["_command"] = cmd_match2.group(4).strip()[:200]
+            return out
+
+        # CONFIGURATION changed: "Configuration is changed ..."
+        if "configuration" in payload_stripped.lower() and "changed" in payload_stripped.lower():
+            out["action"] = "log"
+            out["app"] = "CONFIGURATION"
+            # Try to extract user
+            user_match = re.search(r'by\s+(\S+)', payload_stripped)
+            if user_match:
+                out["user"] = re.sub(r'[\x00-\x1f\x7f]', '', user_match.group(1))[:128]
+            return out
+
+        # Interface events: "ETH/IF status changed to UP/DOWN"
+        # BUG-04: Use [^\n]{0,100} instead of .*? to prevent backtracking
+        if_match = re.search(
+            r'((?:GigabitEthernet|Ten-GigabitEthernet|Ethernet|Vlan-interface|LoopBack)\S*)\s+'
+            r'[^\n]{0,100}?(up|down)',
+            payload_stripped, re.IGNORECASE
+        )
+        if if_match:
+            out["action"] = "log"
+            out["app"] = if_match.group(1)
+            out["_status"] = if_match.group(2).upper()
+            return out
+
+        # Generic fallback: extract any IP addresses from payload
+        # BUG-01: Validate IPs — raw regex matches invalid addresses
+        ip_matches = re.findall(r'\d+\.\d+\.\d+\.\d+', payload_stripped)
+        valid_ips = [ip for ip in ip_matches if self._is_valid_ip(ip)]
+        if valid_ips:
+            out["src"] = valid_ips[0]
+            if len(valid_ips) > 1:
+                out["dst"] = valid_ips[1]
+
+        # Try to find username patterns
+        user_match = re.search(
+            r'(?:user|username|User|Username)[=:\s]+(\S+)', payload_stripped
+        )
+        if user_match:
+            out["user"] = re.sub(r'[\x00-\x1f\x7f]', '', user_match.group(1).rstrip('.,;'))[:128]
+
+        # Set action based on mnemonic keywords
+        mnemonic_upper = mnemonic.upper()
+        match mnemonic_upper:
+            case m if "LOGIN" in m or "LOGON" in m:
+                out["action"] = "permit"
+            case m if "LOGOUT" in m or "LOGOFF" in m:
+                out["action"] = "close"
+            case m if "FAIL" in m or "DENIED" in m or "REJECT" in m:
+                out["action"] = "deny"
+            case m if "CMD" in m or "COMMAND" in m:
+                out["action"] = "log"
+            case m if "UP" in m or "START" in m or "ENABLE" in m:
+                out["action"] = "permit"
+            case m if "DOWN" in m or "STOP" in m or "DISABLE" in m:
+                out["action"] = "close"
+            case _:
+                out["action"] = "log"
+
+        # Only return if we got at least one meaningful field beyond the defaults
+        if any(k in out for k in ("user", "src", "dst", "app", "_command", "_status")):
+            return out
+
+        # Last resort: still return with the event message as the key field
+        # so SGBox at least receives the log for auditing
+        out["action"] = "log"
+        return out
 
     def _derive_action(self, event_raw: str) -> str:
         """

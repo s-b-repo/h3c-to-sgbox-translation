@@ -241,7 +241,7 @@ def run_cli_mode(config: dict, input_path: str, output_path: str):
     parser = H3CLogParser()
     fmt_config = config.get("output", {})
     formatter = SGBoxFormatter(
-        output_format=fmt_config.get("format", "extended"),
+        output_format=fmt_config.get("format", "cef"),
         include_hostname=fmt_config.get("include_hostname", "true").lower() == "true",
         include_timestamp=fmt_config.get("include_timestamp", "true").lower() == "true",
     )
@@ -269,7 +269,10 @@ def run_cli_mode(config: dict, input_path: str, output_path: str):
                         parsed = parser.parse(line)
 
                 if parsed:
-                    formatted = formatter.format(parsed)
+                    if formatter.output_format == "cef":
+                        formatted = formatter.format_cef(parsed)
+                    else:
+                        formatted = formatter.format(parsed)
                     if formatted:
                         out_file.write(formatted + "\n")
                         translated_count += 1
@@ -294,6 +297,149 @@ def run_cli_mode(config: dict, input_path: str, output_path: str):
     print(f"{'='*60}")
 
 
+async def probe_sgbox_connectivity(sgbox_config: dict, tls_config: dict) -> dict:
+    """
+    Test connectivity to SGBox via UDP, TCP, and TLS at startup.
+
+    Returns dict: {'host:port': {'udp': bool, 'tcp': bool, 'tls': bool}}
+    Server should continue if at least one protocol works for any host.
+    """
+    import ssl as _ssl
+    import socket
+
+    raw_hosts = sgbox_config.get("host", "")
+    hosts = [h.strip() for h in raw_hosts.split(",") if h.strip()]
+
+    # BUG-08: Safely parse ports with fallback
+    try:
+        port = int(sgbox_config.get("port", "514"))
+    except (ValueError, TypeError):
+        port = 514
+        print(f"[PROBE] ⚠ Invalid port config, defaulting to {port}")
+
+    # BUG-05: TLS uses separate port config key, default 6514
+    try:
+        tls_port = int(sgbox_config.get("tls_port", "6514"))
+    except (ValueError, TypeError):
+        tls_port = 6514
+
+    if not hosts:
+        print(f"[PROBE] ⚠ No SGBox hosts configured — skipping connectivity check")
+        return {}
+
+    print(f"\n{'─'*60}")
+    print(f"[PROBE] SGBox Connectivity Check")
+    print(f"[PROBE] Syslog port: {port}  |  TLS port: {tls_port}")
+    print(f"{'─'*60}")
+
+    results: dict[str, dict[str, bool]] = {}
+    any_working = False
+
+    for host in hosts:
+        host_results: dict[str, bool] = {}
+        target = f"{host}:{port}"
+        print(f"\n[PROBE] Testing {host}...")
+
+        # BUG-07: Set global default timeout to limit DNS resolution
+        old_timeout = socket.getdefaulttimeout()
+        socket.setdefaulttimeout(5)
+
+        # ── UDP Probe (BUG-06: use try/finally for socket cleanup) ──
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            sock.settimeout(3)
+            test_msg = b"<134>h3c-translator: connectivity-probe"
+            sock.sendto(test_msg, (host, port))
+            host_results["udp"] = True
+            any_working = True
+            print(f"[PROBE]   ✓ UDP/{port}  — packet sent (connectionless, no ACK expected)")
+        except Exception as e:
+            host_results["udp"] = False
+            print(f"[PROBE]   ✗ UDP/{port}  — {e}")
+        finally:
+            if sock:
+                sock.close()
+
+        # ── TCP Probe (BUG-06: use try/finally) ──────────────────────
+        sock = None
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((host, port))
+            host_results["tcp"] = True
+            any_working = True
+            print(f"[PROBE]   ✓ TCP/{port}  — connection established")
+        except Exception as e:
+            host_results["tcp"] = False
+            print(f"[PROBE]   ✗ TCP/{port}  — {e}")
+        finally:
+            if sock:
+                sock.close()
+
+        # ── TLS Probe (BUG-06: use try/finally) ──────────────────────
+        sock = None
+        tls_sock = None
+        try:
+            context = _ssl.create_default_context()
+            ca_file = tls_config.get("ca_file", "")
+            if ca_file and os.path.exists(ca_file):
+                context.load_verify_locations(ca_file)
+                print(f"[PROBE]     (using CA bundle: {ca_file})")
+            else:
+                context.check_hostname = False
+                context.verify_mode = _ssl.CERT_NONE
+
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            tls_sock = context.wrap_socket(sock, server_hostname=host)
+            tls_sock.connect((host, tls_port))
+            peer_cert = tls_sock.getpeercert()
+            tls_version = tls_sock.version()
+            host_results["tls"] = True
+            any_working = True
+            cn_info = ""
+            if peer_cert:
+                try:
+                    cn_info = f" (CN={peer_cert['subject'][0][0][1]})"
+                except (KeyError, IndexError):
+                    pass
+            print(f"[PROBE]   ✓ TLS/{tls_port} — {tls_version} handshake OK{cn_info}")
+        except Exception as e:
+            host_results["tls"] = False
+            print(f"[PROBE]   ✗ TLS/{tls_port} — {e}")
+        finally:
+            if tls_sock:
+                tls_sock.close()
+            elif sock:
+                sock.close()
+
+        # Restore default timeout
+        socket.setdefaulttimeout(old_timeout)
+
+        results[target] = host_results
+
+        # Summary for this host
+        working = [p for p, ok in host_results.items() if ok]
+        failed = [p for p, ok in host_results.items() if not ok]
+        if working:
+            print(f"[PROBE]   → {host}: {', '.join(working)} working")
+        if failed:
+            print(f"[PROBE]   → {host}: {', '.join(failed)} FAILED")
+
+    # ── Overall Summary ───────────────────────────────────────────
+    print(f"\n{'─'*60}")
+    if any_working:
+        print(f"[PROBE] ✓ At least one protocol works — server will continue")
+    else:
+        print(f"[PROBE] ✗ WARNING: ALL connectivity checks FAILED!")
+        print(f"[PROBE]   Server will start anyway, but logs may not reach SGBox.")
+        print(f"[PROBE]   Check: firewall rules, SGBox service status, host/port config")
+    print(f"{'─'*60}\n")
+
+    return results
+
+
 async def run_server(config: dict):
     """
     Run the translator server (fully async).
@@ -304,13 +450,21 @@ async def run_server(config: dict):
     print(f"[SERVER] Starting H3C-to-SGBox Translator Server v2.0.0")
     print(f"{'='*60}\n")
 
+    # ── Startup: SGBox connectivity probe ─────────────────────────
+    sgbox_config = config.get("sgbox", {})
+    tls_config = config.get("tls", {})
+    mode = sgbox_config.get("mode", "pull").lower()
+
+    if mode == "push":
+        await probe_sgbox_connectivity(sgbox_config, tls_config)
+
     # ── Initialize components ──────────────────────────────────────
     print(f"[SERVER] Initializing components...")
     parser = H3CLogParser()
 
     fmt_config = config.get("output", {})
     formatter = SGBoxFormatter(
-        output_format=fmt_config.get("format", "extended"),
+        output_format=fmt_config.get("format", "cef"),
         include_hostname=fmt_config.get("include_hostname", "true").lower() == "true",
         include_timestamp=fmt_config.get("include_timestamp", "true").lower() == "true",
     )
@@ -379,11 +533,19 @@ async def run_server(config: dict):
                   f"src={parsed.get('src', '?')} dst={parsed.get('dst', '?')} "
                   f"action={parsed.get('action', '?')}")
 
-            syslog_msg = formatter.format_syslog(
-                parsed,
-                facility=sgbox_config.get("facility", "local0"),
-                severity=sgbox_config.get("severity", "info"),
-            )
+            # Format: use CEF (SGBox native) or legacy key=value
+            if formatter.output_format == "cef":
+                syslog_msg = formatter.format_syslog_cef(
+                    parsed,
+                    facility=sgbox_config.get("facility", "local0"),
+                    severity=sgbox_config.get("severity", "info"),
+                )
+            else:
+                syslog_msg = formatter.format_syslog(
+                    parsed,
+                    facility=sgbox_config.get("facility", "local0"),
+                    severity=sgbox_config.get("severity", "info"),
+                )
 
             if not syslog_msg:
                 print(f"[PIPELINE] ✗ Formatter returned None — missing required fields")

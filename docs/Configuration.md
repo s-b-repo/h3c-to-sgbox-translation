@@ -47,16 +47,20 @@ Controls how translated logs are delivered to SGBox.
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `mode` | `push` | **`push`** (recommended) — translator forwards logs to SGBox over TLS. **`pull`** — SGBox collector connects to translator's `output_port` |
-| `host` | — | SGBox SIEM IP address (push mode). **Must be an external/routable address.** Supports multiple destinations: `host = 10.10.0.52,10.10.0.53` for parallel fan-out |
-| `port` | `6154` | SGBox syslog TLS port (push mode) |
+| `mode` | `push` | **`push`** (recommended) — translator forwards logs to SGBox. **`pull`** — SGBox collector connects to translator's `output_port` |
+| `host` | — | **REQUIRED.** SGBox SIEM IP address or hostname (push mode). Supports multiple destinations: `host = 10.10.0.52,10.10.0.53` for parallel fan-out |
+| `port` | `514` | SGBox syslog port. Standard: 514 for UDP/TCP, 6514 for TLS |
+| `tls_port` | `6514` | TLS syslog port (only used when `protocol = tls`) |
 | `output_port` | `1514` | TCP port SGBox collectors connect to (pull mode only) |
-| `protocol` | `tls` | Output protocol: `tls` (encrypted, recommended), `tcp`, or `udp` |
-| `sgbox_api_key` | — | SGBox API key for log ingestion authentication. Obtain from **SGBox Console → SCM → Configuration → API Keys** |
+| `protocol` | `udp` | Output protocol: `udp` (recommended), `tcp`, or `tls` |
+| `forwarder_backend` | `rsyslog` | **`rsyslog`** (recommended) — uses the system rsyslog daemon for forwarding. Generates `/etc/rsyslog.d/h3c-sgbox.conf` and restarts rsyslog automatically. **`python`** — legacy direct socket forwarding with built-in retry |
+| `rsyslog_log_scope` | `all` | Log scope when using rsyslog backend: **`all`** (`*.*` — all logs) or **`auth`** (`auth,authpriv.*` — authentication logs only) |
 | `facility` | `local0` | Syslog facility header (`local0`–`local7`, `user`, `daemon`, etc.) |
 | `severity` | `info` | Syslog severity header (`emerg`, `alert`, `crit`, `err`, `warning`, `notice`, `info`, `debug`) |
 
-> **Important:** When using `mode = push` with `protocol = tls`, the translator uses the `ca_file` from `[tls]` to verify SGBox's certificate. The auto-fetched CA bundle handles this automatically.
+> **rsyslog backend (default):** On startup, the translator writes `/etc/rsyslog.d/h3c-sgbox.conf` with the appropriate forwarding rule (e.g. `*.* @SGBox-IP` for UDP) and restarts the rsyslog daemon. Messages are sent via the `logger` command. If rsyslog is not installed, the translator falls back to the `python` backend automatically.
+>
+> **python backend (legacy):** Opens direct UDP/TCP/TLS sockets from Python with tenacity exponential backoff retry. Does not require rsyslog.
 
 ## `[output]`
 

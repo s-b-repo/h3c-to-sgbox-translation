@@ -2,18 +2,23 @@
 Async Syslog Forwarder
 
 Forwards translated log messages to the SGBox SIEM server via:
-  - UDP syslog (fastest, no delivery guarantee)
-  - TCP syslog (reliable, ordered delivery)
-  - TLS syslog (encrypted + reliable)
+  - rsyslog backend (DEFAULT) — writes to local rsyslog, which handles delivery
+  - python backend (LEGACY)  — direct UDP/TCP/TLS sockets from Python
 
-Fully async with tenacity retry logic for automatic reconnection.
+The rsyslog backend follows the SGBox Debian integration guide:
+  1. Install rsyslog:  apt-get -y install rsyslog
+  2. Generate /etc/rsyslog.d/h3c-sgbox.conf with forwarding rule
+  3. Restart rsyslog daemon
+  4. Send messages via `logger` command
 
 Dependencies: structlog, tenacity
 """
 
 import asyncio
 import os
+import shutil
 import ssl
+import syslog as _syslog
 
 import structlog
 from tenacity import (
@@ -26,35 +31,69 @@ from tenacity import (
 
 logger = structlog.get_logger(__name__)
 
+# rsyslog drop-in config path
+RSYSLOG_CONF_DIR = "/etc/rsyslog.d"
+RSYSLOG_CONF_FILE = os.path.join(RSYSLOG_CONF_DIR, "h3c-sgbox.conf")
+
+# Syslog facility codes (from syslog module)
+FACILITY_MAP = {
+    "kern": _syslog.LOG_KERN, "user": _syslog.LOG_USER,
+    "mail": _syslog.LOG_MAIL, "daemon": _syslog.LOG_DAEMON,
+    "auth": _syslog.LOG_AUTH, "syslog": _syslog.LOG_SYSLOG,
+    "lpr": _syslog.LOG_LPR, "news": _syslog.LOG_NEWS,
+    "cron": _syslog.LOG_CRON, "local0": _syslog.LOG_LOCAL0,
+    "local1": _syslog.LOG_LOCAL1, "local2": _syslog.LOG_LOCAL2,
+    "local3": _syslog.LOG_LOCAL3, "local4": _syslog.LOG_LOCAL4,
+    "local5": _syslog.LOG_LOCAL5, "local6": _syslog.LOG_LOCAL6,
+    "local7": _syslog.LOG_LOCAL7,
+}
+
+# Syslog severity codes (from syslog module)
+SEVERITY_MAP = {
+    "emerg": _syslog.LOG_EMERG, "alert": _syslog.LOG_ALERT,
+    "crit": _syslog.LOG_CRIT, "err": _syslog.LOG_ERR,
+    "warning": _syslog.LOG_WARNING, "notice": _syslog.LOG_NOTICE,
+    "info": _syslog.LOG_INFO, "debug": _syslog.LOG_DEBUG,
+}
+
 
 class SyslogForwarder:
     """
-    Async syslog forwarder to SGBox over UDP, TCP, or TLS.
+    Async syslog forwarder to SGBox.
+
+    Supports two backends:
+        - rsyslog (default): Configures system rsyslog to forward to SGBox,
+          sends messages via `logger` command. Recommended for Debian/SGBox.
+        - python (legacy): Direct async UDP/TCP/TLS sockets with tenacity retry.
 
     Features:
-        - Fully async I/O using asyncio streams
-        - Automatic reconnection with tenacity exponential backoff
-        - Message queueing during reconnection
+        - Automatic rsyslog configuration generation and deployment
+        - Fallback to direct Python sockets when rsyslog is unavailable
+        - Message queueing and retry (python backend)
         - Connection health monitoring
     """
 
     def __init__(self, config: dict):
         sgbox = config.get("sgbox", {})
-        self.host = sgbox.get("host", "127.0.0.1")
+        self.host = sgbox.get("host", "").strip()
+        if not self.host:
+            print(f"[FORWARDER] ✗ FATAL: No SGBox host configured in [sgbox] section")
+            print(f"[FORWARDER]   Set 'host = <SGBox-IP>' in translator.config")
+            raise ValueError("SGBox host not configured — set 'host' in [sgbox] config section")
         self.port = int(sgbox.get("port", 514))
         self.protocol = sgbox.get("protocol", "udp").lower()
         self.facility = sgbox.get("facility", "local0")
         self.severity = sgbox.get("severity", "info")
+        self.backend = sgbox.get("forwarder_backend", "rsyslog").lower()
+        self.rsyslog_log_scope = sgbox.get("rsyslog_log_scope", "all").lower()
 
-        # SGBox API key for log ingestion authentication
-        self._sgbox_api_key = sgbox.get("sgbox_api_key", "").strip()
-        _INSECURE_SGBOX_KEYS = ("", "CHANGE_ME_SET_YOUR_SGBOX_API_KEY")
-        if self._sgbox_api_key in _INSECURE_SGBOX_KEYS:
-            print(f"[FORWARDER] ⚠ WARNING: sgbox_api_key is not set!")
-            print(f"[FORWARDER]   SGBox requires an API key for log ingestion on port {self.port}")
-            print(f"[FORWARDER]   Get it from SGBox: SCM → Configuration → API Keys")
-            print(f"[FORWARDER]   Set [sgbox] sgbox_api_key = <your key> in translator.config")
-            self._sgbox_api_key = ""
+        # NOTE: SGBox syslog ingestion does NOT use API keys.
+        # API keys are only for SGBox REST API integrations.
+        _legacy_key = sgbox.get("sgbox_api_key", "").strip()
+        if _legacy_key and _legacy_key not in ("", "CHANGE_ME_SET_YOUR_SGBOX_API_KEY"):
+            print(f"[FORWARDER] ⚠ WARNING: sgbox_api_key is configured but NOT used")
+            print(f"[FORWARDER]   SGBox syslog (UDP/TCP/TLS) does not require API keys.")
+            print(f"[FORWARDER]   The API key config option has been removed.")
 
         self._tls_config = config.get("tls", {})
         self._reader: asyncio.StreamReader | None = None
@@ -71,21 +110,228 @@ class SyslogForwarder:
         # MED-04: Lock for thread-safe stats updates
         self._stats_lock = asyncio.Lock()
 
+        # Resolve syslog facility/severity to numeric codes for syslog module
+        self._syslog_facility = FACILITY_MAP.get(self.facility, _syslog.LOG_LOCAL0)
+        self._syslog_severity = SEVERITY_MAP.get(self.severity, _syslog.LOG_INFO)
+        self._syslog_opened = False
+
+        # Validate backend choice
+        match self.backend:
+            case "rsyslog":
+                # Check if rsyslog is available on this system
+                if not shutil.which("rsyslogd"):
+                    print(f"[FORWARDER] ⚠ rsyslogd not found on PATH — falling back to python backend")
+                    print(f"[FORWARDER]   Install rsyslog: apt-get -y install rsyslog")
+                    self.backend = "python"
+            case "python":
+                pass  # Legacy mode, no extra checks
+            case _:
+                print(f"[FORWARDER] ⚠ Unknown backend '{self.backend}', defaulting to rsyslog")
+                self.backend = "rsyslog"
+
         print(f"[FORWARDER] Initialized")
+        print(f"[FORWARDER]   Backend:      {self.backend.upper()}")
         print(f"[FORWARDER]   Protocol:     {self.protocol.upper()}")
         print(f"[FORWARDER]   Target:       {self.host}:{self.port}")
-        print(f"[FORWARDER]   SGBox API key: {'configured' if self._sgbox_api_key else 'NOT SET'}")
         print(f"[FORWARDER]   Facility:     {self.facility}")
         print(f"[FORWARDER]   Severity:     {self.severity}")
+        if self.backend == "rsyslog":
+            print(f"[FORWARDER]   Log scope:    {self.rsyslog_log_scope}")
 
     @property
     def stats(self) -> dict[str, int]:
         # LOW-05: Return a copy (lock is asyncio.Lock, can't await in property)
         return self._stats.copy()
 
+    # ══════════════════════════════════════════════════════════════════
+    #  Connect / Setup
+    # ══════════════════════════════════════════════════════════════════
+
     async def connect(self):
-        """Establish async connection to SGBox."""
-        print(f"\n[FORWARDER] Connecting to SGBox at {self.host}:{self.port} via {self.protocol.upper()}...")
+        """Establish connection or configure rsyslog for SGBox forwarding."""
+        print(f"\n[FORWARDER] Setting up forwarding to SGBox at {self.host}:{self.port}...")
+        match self.backend:
+            case "rsyslog":
+                await self._setup_rsyslog()
+            case "python":
+                await self._connect_python()
+
+    # ── rsyslog backend ────────────────────────────────────────────────
+
+    def _generate_rsyslog_config(self) -> str:
+        """
+        Generate rsyslog forwarding config content for SGBox.
+
+        Following the SGBox Debian integration guide:
+          - @ prefix  = UDP forwarding
+          - @@ prefix = TCP forwarding
+        """
+        # Determine forwarding prefix based on protocol
+        match self.protocol:
+            case "udp":
+                prefix = "@"
+                proto_comment = "UDP"
+            case "tcp":
+                prefix = "@@"
+                proto_comment = "TCP"
+            case "tls":
+                prefix = "@@"
+                proto_comment = "TCP/TLS"
+            case _:
+                prefix = "@"
+                proto_comment = "UDP (default)"
+
+        # Determine log scope
+        match self.rsyslog_log_scope:
+            case "auth":
+                selector = "auth,authpriv.*"
+                scope_comment = "authentication logs only"
+            case _:
+                selector = "*.*"
+                scope_comment = "all logs"
+
+        # Build target with optional port (omit if default 514)
+        if self.port != 514:
+            target = f"{prefix}{self.host}:{self.port}"
+        else:
+            target = f"{prefix}{self.host}"
+
+        lines = [
+            "# ──────────────────────────────────────────────────────────────",
+            "# H3C-to-SGBox Translator — rsyslog forwarding config",
+            "# Auto-generated by h3c-sgbox-translator",
+            f"# Protocol: {proto_comment} | Scope: {scope_comment}",
+            "# ──────────────────────────────────────────────────────────────",
+            "",
+        ]
+
+        # Add TLS configuration if protocol is TLS
+        if self.protocol == "tls":
+            ca_file = self._tls_config.get("ca_file", "")
+            lines.extend([
+                "# TLS configuration for encrypted syslog forwarding",
+                '$DefaultNetstreamDriver gtls',
+                f'$DefaultNetstreamDriverCAFile {ca_file}' if ca_file else '# $DefaultNetstreamDriverCAFile /path/to/ca.pem',
+                '$ActionSendStreamDriver gtls',
+                '$ActionSendStreamDriverMode 1',
+                '$ActionSendStreamDriverAuthMode anon',
+                "",
+            ])
+
+        lines.append(f"{selector} {target}")
+        lines.append("")
+
+        return "\n".join(lines)
+
+    async def _setup_rsyslog(self):
+        """
+        Install rsyslog forwarding config and restart the daemon.
+
+        Creates /etc/rsyslog.d/h3c-sgbox.conf with the appropriate
+        forwarding rule pointing at the SGBox SIEM server.
+        """
+        print(f"[FORWARDER] Configuring rsyslog for SGBox forwarding...")
+
+        config_content = self._generate_rsyslog_config()
+        print(f"[FORWARDER] Generated rsyslog config:")
+        for line in config_content.strip().split("\n"):
+            print(f"[FORWARDER]   {line}")
+
+        # Check if config directory exists
+        if not os.path.isdir(RSYSLOG_CONF_DIR):
+            print(f"[FORWARDER] ✗ rsyslog config dir not found: {RSYSLOG_CONF_DIR}")
+            print(f"[FORWARDER]   Falling back to python backend for this session")
+            self.backend = "python"
+            await self._connect_python()
+            return
+
+        # Write the config file
+        try:
+            # Check if existing config is identical (skip restart if unchanged)
+            if os.path.isfile(RSYSLOG_CONF_FILE):
+                with open(RSYSLOG_CONF_FILE, "r") as f:
+                    existing = f.read()
+                if existing.strip() == config_content.strip():
+                    print(f"[FORWARDER] ✓ rsyslog config unchanged, skipping restart")
+                    self._connected = True
+                    return
+
+            with open(RSYSLOG_CONF_FILE, "w") as f:
+                f.write(config_content)
+            print(f"[FORWARDER] ✓ Config written to {RSYSLOG_CONF_FILE}")
+        except PermissionError:
+            print(f"[FORWARDER] ✗ Permission denied writing {RSYSLOG_CONF_FILE}")
+            print(f"[FORWARDER]   Run as root or use: sudo python3 -m src.translator ...")
+            print(f"[FORWARDER]   Falling back to python backend for this session")
+            self.backend = "python"
+            await self._connect_python()
+            return
+        except OSError as e:
+            print(f"[FORWARDER] ✗ Failed to write rsyslog config: {e}")
+            self.backend = "python"
+            await self._connect_python()
+            return
+
+        # Restart rsyslog to load the new config
+        print(f"[FORWARDER] Restarting rsyslog daemon...")
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "systemctl", "restart", "rsyslog",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+            match proc.returncode:
+                case 0:
+                    print(f"[FORWARDER] ✓ rsyslog restarted successfully")
+                    self._connected = True
+                    logger.info("forwarder.rsyslog_configured",
+                                host=self.host, port=self.port,
+                                protocol=self.protocol,
+                                config_file=RSYSLOG_CONF_FILE)
+                case _:
+                    err_msg = stderr.decode().strip() if stderr else "unknown error"
+                    print(f"[FORWARDER] ✗ rsyslog restart FAILED (exit {proc.returncode}): {err_msg}")
+                    # Try service command as fallback (non-systemd systems)
+                    await self._restart_rsyslog_service()
+        except asyncio.TimeoutError:
+            print(f"[FORWARDER] ✗ rsyslog restart TIMED OUT (15s)")
+            await self._restart_rsyslog_service()
+        except FileNotFoundError:
+            print(f"[FORWARDER] systemctl not found, trying 'service' command...")
+            await self._restart_rsyslog_service()
+
+    async def _restart_rsyslog_service(self):
+        """Fallback: restart rsyslog via 'service' command (non-systemd)."""
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "service", "rsyslog", "restart",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=15.0)
+            match proc.returncode:
+                case 0:
+                    print(f"[FORWARDER] ✓ rsyslog restarted via 'service' command")
+                    self._connected = True
+                case _:
+                    err_msg = stderr.decode().strip() if stderr else "unknown error"
+                    print(f"[FORWARDER] ✗ 'service rsyslog restart' FAILED: {err_msg}")
+                    print(f"[FORWARDER]   rsyslog config was written but daemon not restarted")
+                    print(f"[FORWARDER]   Manually run: service rsyslog restart")
+                    # Config is written, mark as connected — it will work after manual restart
+                    self._connected = True
+        except Exception as e:
+            print(f"[FORWARDER] ✗ Service restart failed: {e}")
+            print(f"[FORWARDER]   Config written to {RSYSLOG_CONF_FILE}")
+            print(f"[FORWARDER]   Manually run: service rsyslog restart")
+            self._connected = True
+
+    # ── python backend (legacy) ────────────────────────────────────────
+
+    async def _connect_python(self):
+        """Establish async connection to SGBox (legacy python backend)."""
+        print(f"\n[FORWARDER] Connecting to SGBox at {self.host}:{self.port} via {self.protocol.upper()} (python backend)...")
         match self.protocol:
             case "udp":
                 await self._connect_udp()
@@ -167,31 +413,65 @@ class SyslogForwarder:
             print(f"[FORWARDER] ✗ Connection FAILED to {self.host}:{self.port}: {e}")
             raise
 
+    # ══════════════════════════════════════════════════════════════════
+    #  Send
+    # ══════════════════════════════════════════════════════════════════
+
     async def send(self, message: str):
         """
         Send a single syslog message to SGBox (async).
 
-        Handles reconnection for TCP/TLS on failure.
+        Dispatches to rsyslog (via logger command) or python backend.
         """
         if not message:
             print(f"[FORWARDER] ✗ Empty message, skipping")
             return
 
-        # Prepend SGBox API key if configured
-        if self._sgbox_api_key:
-            outgoing = f"APIKEY:{self._sgbox_api_key} {message}"
-        else:
-            outgoing = message
+        match self.backend:
+            case "rsyslog":
+                await self._send_rsyslog(message)
+            case "python":
+                # Send as clean syslog — SGBox syslog ingestion does NOT use API keys
+                data = (message + "\n").encode("utf-8")
+                print(f"[FORWARDER] Sending {len(data)}B via {self.protocol.upper()} (python)")
+                match self.protocol:
+                    case "udp":
+                        await self._send_udp(data)
+                    case _:
+                        await self._send_tcp(data)
 
-        data = (outgoing + "\n").encode("utf-8")
-        # MED-05: Never log the full outgoing (contains API key)
-        print(f"[FORWARDER] Sending {len(data)}B via {self.protocol.upper()}")
+    # ── rsyslog send ───────────────────────────────────────────────────
 
-        match self.protocol:
-            case "udp":
-                await self._send_udp(data)
-            case _:
-                await self._send_tcp(data)
+    async def _send_rsyslog(self, message: str):
+        """
+        Send message directly to rsyslog via Python's syslog module.
+
+        Writes to /dev/log (Unix domain socket) — zero subprocess overhead.
+        rsyslog then forwards to SGBox per /etc/rsyslog.d/h3c-sgbox.conf.
+        """
+        # Open syslog connection if not already open
+        if not self._syslog_opened:
+            _syslog.openlog(
+                ident="h3c-translator",
+                logoption=_syslog.LOG_PID | _syslog.LOG_NDELAY,
+                facility=self._syslog_facility,
+            )
+            self._syslog_opened = True
+            print(f"[FORWARDER] ✓ syslog socket opened (facility={self.facility})")
+
+        try:
+            # syslog.syslog() writes directly to /dev/log — picked up by rsyslog
+            _syslog.syslog(self._syslog_severity, message)
+            async with self._stats_lock:
+                self._stats["messages_sent"] += 1
+            print(f"[FORWARDER] ✓ rsyslog message sent ({len(message)}B)")
+        except Exception as e:
+            async with self._stats_lock:
+                self._stats["messages_failed"] += 1
+            print(f"[FORWARDER] ✗ syslog send error: {e}")
+            logger.error("forwarder.rsyslog_send_error", error=str(e))
+
+    # ── python send (legacy) ───────────────────────────────────────────
 
     async def _send_udp(self, data: bytes):
         """Send message via async UDP transport."""
@@ -256,6 +536,10 @@ class SyslogForwarder:
                 except Exception as e2:
                     print(f"[FORWARDER] ✗ Reconnect + resend FAILED: {e2} — message LOST")
 
+    # ══════════════════════════════════════════════════════════════════
+    #  TLS / Cleanup
+    # ══════════════════════════════════════════════════════════════════
+
     def _create_ssl_context(self) -> ssl.SSLContext:
         """Create SSL context for outbound TLS connection to SGBox."""
         print(f"[FORWARDER] Building outbound TLS context...")
@@ -311,11 +595,23 @@ class SyslogForwarder:
         """Close the forwarder connection."""
         print(f"[FORWARDER] Closing connection...")
         async with self._lock:
-            if self._transport:
-                self._transport.close()
-                self._transport = None
-                print(f"[FORWARDER] UDP transport closed")
-            await self._safe_close()
+            match self.backend:
+                case "rsyslog":
+                    # Close syslog socket
+                    if self._syslog_opened:
+                        _syslog.closelog()
+                        self._syslog_opened = False
+                    # rsyslog keeps running — we don't remove the config
+                    # so forwarding continues even after translator stops
+                    print(f"[FORWARDER] rsyslog backend — config persists at {RSYSLOG_CONF_FILE}")
+                    print(f"[FORWARDER]   To stop forwarding: rm {RSYSLOG_CONF_FILE} && systemctl restart rsyslog")
+                case "python":
+                    if self._transport:
+                        self._transport.close()
+                        self._transport = None
+                        print(f"[FORWARDER] UDP transport closed")
+                    await self._safe_close()
+
             self._connected = False
             print(f"[FORWARDER] ✓ Forwarder closed. Final stats: {self._stats}")
             logger.info("forwarder.closed")

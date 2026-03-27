@@ -53,7 +53,8 @@ apt-get install -y -qq \
     openssl \
     curl \
     ca-certificates \
-    gnupg
+    gnupg \
+    rsyslog
 echo "    ✓ System packages installed"
 
 # ── Create service user ───────────────────────────────────────────

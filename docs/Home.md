@@ -51,12 +51,13 @@ proto=TCP src=68.183.184.83 dst=102.134.120.157 sport=46644 dport=22 action=perm
 
 | Feature | Description |
 |---------|-------------|
-| **TLS Forwarding** | Pushes logs to SGBox over TLS on port 6154 with auto-fetched Google Trust Services + system CA bundle |
+| **rsyslog Forwarding** | Uses the system rsyslog daemon to forward logs to SGBox (default). Follows SGBox's official Debian syslog guide |
+| **TLS Forwarding** | Supports TLS-encrypted push to SGBox with auto-fetched Google Trust Services + system CA bundle |
 | **Async Architecture** | Fully async I/O via `asyncio` + `uvloop` — handles thousands of concurrent connections |
 | **GPG Encryption** | Optional at-rest GPG encryption (symmetric/asymmetric) compatible with SGBox's scheme |
 | **REST API** | HTTPS API for health checks, stats, and ad-hoc translation testing |
 | **IP Whitelisting** | CIDR-based whitelist enforced on all listeners |
-| **Auto-Reconnect** | Tenacity exponential backoff for resilient SGBox connectivity |
+| **Auto-Fallback** | Falls back to direct Python sockets if rsyslog is not available |
 
 ## Getting Started
 

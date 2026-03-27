@@ -14,14 +14,18 @@ sudo journalctl -u h3c-translator -f | grep -i error
 # View the application's own log file
 tail -f /var/log/h3c-translator/translator.log
 
+# Check rsyslog config and status
+cat /etc/rsyslog.d/h3c-sgbox.conf
+sudo systemctl status rsyslog
+
 # Test inbound TLS connectivity (from H3C's perspective)
 openssl s_client -connect localhost:6514
 
 # Test outbound TLS to SGBox (from translator's perspective)
-openssl s_client -connect <SGBOX_IP>:6154 -CAfile /etc/h3c-translator/certs/ca-bundle.pem
+openssl s_client -connect <SGBOX_IP>:6514 -CAfile /etc/h3c-translator/certs/ca-bundle.pem
 
 # Check which processes are on the required ports
-ss -tlnp | grep -E '(514|1514|6514|6154|8443)'
+ss -tlnp | grep -E '(514|1514|6514|8443)'
 
 # Verify the CA bundle is valid
 openssl x509 -in /etc/h3c-translator/certs/ca-bundle.pem -text -noout | head -20
@@ -33,11 +37,13 @@ openssl x509 -in /etc/h3c-translator/certs/ca-bundle.pem -text -noout | head -20
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
+| `forwarder.backend=python` when rsyslog expected | rsyslog not installed | Run `apt-get -y install rsyslog` and restart the translator |
 | `RuntimeError: TLS cert_file not configured` | Missing inbound TLS certificates | Run `install.sh` to generate them, or set `allow_plaintext = true` temporarily |
-| `forwarder.connection_lost` in logs | TLS handshake failed to SGBox | Verify SGBox is listening on port 6154. Test with `openssl s_client -connect <SGBOX_IP>:6154` |
+| `forwarder.connection_lost` in logs | TLS handshake failed to SGBox | Verify SGBox is listening. Test with `openssl s_client -connect <SGBOX_IP>:6514` |
 | `ssl.SSLCertVerificationError` | CA bundle cannot verify SGBox's cert | Re-run `install.sh` to refresh the CA bundle, or manually rebuild it (see below) |
-| `ConnectionRefusedError` on port 6154 | SGBox not listening on that port | Confirm SGBox is configured to accept TLS syslog on port 6154 |
+| `ConnectionRefusedError` | SGBox not listening on port | Confirm SGBox is configured to accept syslog on the configured port |
 | Service starts then exits immediately | Port already in use | Check with `ss -tlnp \| grep 6514` — another process may be binding the port |
+| `/etc/rsyslog.d/h3c-sgbox.conf` not created | Permission denied | Run the translator as root or with sudo, or manually write the rsyslog config |
 
 ### API Errors
 
@@ -85,3 +91,31 @@ A comprehensive architectural audit was performed in March 2026. Major findings 
 | **Bulk JSON Memory Spikes** | Medium | Restricted payload to 512KB max, capped array at 1000 lines |
 | **Daemonization on Windows** | Low | Added explicit OS check with graceful error message |
 | **No TLS cert verification** | Medium | Auto-fetched CA bundle (Google roots + system CAs) with PEM validation |
+| **rsyslog integration** | Enhancement | Uses system rsyslog daemon for forwarding — follows SGBox Debian integration guide |
+
+## rsyslog Backend Troubleshooting
+
+If you're using the rsyslog backend (default), these steps help diagnose forwarding issues:
+
+```bash
+# Verify rsyslog is running
+sudo systemctl status rsyslog
+
+# Check the generated config
+cat /etc/rsyslog.d/h3c-sgbox.conf
+
+# Test rsyslog forwarding manually
+logger -p local0.info -t h3c-test "Test message from h3c-translator"
+
+# Watch rsyslog's own log for errors
+tail -f /var/log/syslog | grep -i error
+
+# Force rsyslog to reload config
+sudo systemctl restart rsyslog
+```
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Config file not created | Translator lacks write access to `/etc/rsyslog.d/` | Run as root or use `forwarder_backend = python` |
+| rsyslog not forwarding | Config file present but rsyslog not restarted | `sudo systemctl restart rsyslog` |
+| Fell back to python backend | rsyslog package not installed | `apt-get -y install rsyslog` |

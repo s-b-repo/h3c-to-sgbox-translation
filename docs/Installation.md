@@ -11,7 +11,7 @@ sudo bash install.sh
 ```
 
 This automatically:
-1. Installs system packages (`python3`, `openssl`, `curl`, `ca-certificates`, etc.)
+1. Installs system packages (`python3`, `openssl`, `curl`, `rsyslog`, `ca-certificates`, etc.)
 2. Creates the `h3c-translator` service user (no login shell)
 3. Creates directories (`/opt/h3c-sgbox-translator`, `/etc/h3c-translator`, `/var/log/h3c-translator`)
 4. Sets up a Python virtual environment with all pip dependencies
@@ -39,7 +39,7 @@ Ensure your system has Python 3.11+ and the required packages:
 
 ```bash
 sudo apt update
-sudo apt install -y python3 python3-pip python3-venv openssl curl ca-certificates
+sudo apt install -y python3 python3-pip python3-venv openssl curl rsyslog ca-certificates
 ```
 
 ### 2. Create a Dedicated Service User
@@ -173,8 +173,9 @@ sudo journalctl -u h3c-translator -f
 
 You should see:
 - `receiver.tls_started port=6514`
-- `forwarder.connected protocol=TLS host=<SGBOX_IP> port=6154`
-- `translator.running output_mode=push output_port=6154`
+- `forwarder.backend=rsyslog`
+- `forwarder.rsyslog_config_written path=/etc/rsyslog.d/h3c-sgbox.conf`
+- `translator.running output_mode=push`
 
 ### 11. Firewall Rules
 

@@ -4,13 +4,14 @@ This guide covers configuring the complete **H3C → Translator → SGBox** pipe
 
 ## Architecture Overview
 
-### Push Mode (Recommended — TLS on Port 6154)
+### Push Mode (Recommended — via rsyslog)
 
-The translator actively pushes translated logs to SGBox over an encrypted TLS connection.
+The translator writes translated logs to the local rsyslog daemon, which forwards them to SGBox over UDP, TCP, or TLS.
 
 ```text
-[H3C Firewall] ──(syslog TLS/TCP)──► [Translator] ──(TLS push)──► [SGBox SIEM]
-                  Port 6514 / 514                     Port 6154
+[H3C Firewall] ──(syslog TLS/TCP)──► [Translator] ──(logger)──► [rsyslog] ──(UDP/TCP/TLS)──► [SGBox SIEM]
+                  Port 6514 / 514                              /etc/rsyslog.d/         Port 514
+                                                               h3c-sgbox.conf
 ```
 
 ### Pull Mode (Legacy — SGBox Connects)
@@ -26,19 +27,46 @@ SGBox collectors connect to the translator's TCP socket to pull logs.
 
 ## 1. Translator Configuration ⚙️
 
-### Push Mode (Recommended)
+### Push Mode (Recommended — rsyslog)
 
 ```ini
 [sgbox]
 mode = push
 host = <SGBOX_IP>
-port = 6154
-protocol = tls
+port = 514
+protocol = udp
+forwarder_backend = rsyslog
+rsyslog_log_scope = all
 facility = local0
 severity = info
 ```
 
-The translator uses the auto-fetched CA bundle at `/etc/h3c-translator/certs/ca-bundle.pem` (created by `install.sh`) to verify SGBox's TLS certificate. No manual certificate configuration is required.
+On startup, the translator:
+1. Generates `/etc/rsyslog.d/h3c-sgbox.conf` containing the forwarding rule (e.g. `*.* @<SGBOX_IP>`)
+2. Restarts the rsyslog daemon (`systemctl restart rsyslog`)
+3. Sends translated messages via the `logger` command
+
+rsyslog handles delivery, queuing, and retry natively.
+
+> **Protocol prefixes in the rsyslog config:**
+> - `@` = UDP forwarding (default)
+> - `@@` = TCP forwarding
+> - `@@` + TLS directives = TLS forwarding
+
+### Push Mode — Python Backend (Legacy)
+
+For environments without rsyslog, set `forwarder_backend = python` to use direct Python sockets:
+
+```ini
+[sgbox]
+mode = push
+host = <SGBOX_IP>
+port = 514
+protocol = udp
+forwarder_backend = python
+```
+
+The python backend includes built-in tenacity exponential backoff for automatic reconnection.
 
 ### Pull Mode (Legacy)
 
@@ -80,14 +108,16 @@ info-center source nat channel loghost log level informational
 
 ### 3.1 Configure Log Source
 
-#### For Push Mode (port 6154)
+#### For Push Mode (rsyslog — recommended)
 
-SGBox needs to be listening for incoming TLS syslog on port 6154:
+SGBox needs to be listening for incoming syslog:
 
 1. Navigate to **LM → Configuration**
 2. Add a new **Syslog Source** (or configure your local Collector)
-3. Set the listener to accept connections on **TCP/TLS port 6154**
-4. The translator will push logs directly — no polling required
+3. Set the listener to accept connections on **UDP port 514** (or TCP/TLS as configured)
+4. The translator's rsyslog daemon will forward logs directly
+
+> **Tip:** If using TLS, configure SGBox to listen on port 6514 and set `protocol = tls` + `port = 6514` in the translator config.
 
 #### For Pull Mode (port 1514)
 
@@ -194,7 +224,7 @@ After uploading to SGBox and restarting the translator, verify the TLS chain:
 
 ```bash
 # Verify SGBox's certificate from the translator host
-openssl s_client -connect <SGBOX_IP>:6154 \
+openssl s_client -connect <SGBOX_IP>:6514 \
   -CAfile /etc/h3c-translator/certs/ca-bundle.pem </dev/null
 
 # Look for: Verify return code: 0 (ok)
@@ -202,7 +232,7 @@ openssl s_client -connect <SGBOX_IP>:6154 \
 
 ```bash
 # Check certificate details
-openssl s_client -connect <SGBOX_IP>:6154 -showcerts </dev/null 2>/dev/null \
+openssl s_client -connect <SGBOX_IP>:6514 -showcerts </dev/null 2>/dev/null \
   | openssl x509 -noout -subject -issuer -dates
 ```
 
@@ -240,5 +270,12 @@ sudo systemctl status h3c-translator
 sudo journalctl -u h3c-translator -f
 
 # Verify port bindings
-ss -tlnp | grep -E '(514|1514|6514|6154|8443)'
+# Verify port bindings
+ss -tlnp | grep -E '(514|1514|6514|8443)'
+
+# Check rsyslog config (push mode with rsyslog backend)
+cat /etc/rsyslog.d/h3c-sgbox.conf
+
+# Verify rsyslog is running and forwarding
+systemctl status rsyslog
 ```

@@ -19,29 +19,32 @@ The H3C-SGBox Translator is a high-performance middleware service that bridges H
 
 | Feature | Description |
 |---------|-------------|
-| 🔒 **TLS Syslog Forwarding** | Pushes translated logs to SGBox over TLS (port 6154) with auto-fetched Google Trust Services + system CA bundle |
+| 📡 **rsyslog Forwarding** | Uses the system rsyslog daemon to forward translated logs to SGBox (default). Follows SGBox's official Debian syslog integration guide |
+| 🔒 **TLS Syslog Forwarding** | Supports TLS-encrypted push to SGBox with auto-fetched Google Trust Services + system CA bundle |
 | ⚡ **Fully Async** | Built on `asyncio` + `uvloop` for thousands of concurrent connections with minimal resource usage |
 | 🔑 **GPG Encryption** | Optional at-rest GPG encryption (AES256 symmetric or asymmetric) compatible with SGBox's scheme |
 | 🌐 **REST API** | HTTPS API for health checks, real-time stats, and ad-hoc log translation |
 | 🛡️ **Security Hardened** | IP whitelisting, API key auth, TLS 1.2+ enforcement, rate limiting, connection caps |
-| 🔄 **Auto-Reconnect** | Tenacity exponential backoff for resilient SGBox connectivity |
-| 📦 **One-Command Install** | Automated `install.sh` with venv, systemd service, CA bundle fetch, and cert generation |
+| 🔄 **Auto-Reconnect** | Automatic fallback to Python direct sockets with tenacity exponential backoff |
+| 📦 **One-Command Install** | Automated `install.sh` with rsyslog, venv, systemd service, CA bundle fetch, and cert generation |
 
 ## 🏗️ Architecture
 
 ```text
-┌─────────────┐   Syslog (TLS/TCP)   ┌──────────────────────────────────┐   TLS Syslog    ┌─────────┐
-│ H3C Firewall │──────────────────────►│  H3C-SGBox Translator            │────────────────►│  SGBox  │
-│              │  Port 6514 / 514     │                                  │   Port 6154     │  SIEM   │
+┌─────────────┐   Syslog (TLS/TCP)   ┌──────────────────────────────────┐                  ┌─────────┐
+│ H3C Firewall │──────────────────────►│  H3C-SGBox Translator            │                  │  SGBox  │
+│              │  Port 6514 / 514     │                                  │                  │  SIEM   │
 └─────────────┘                       │  ┌────────┐  ┌───────────┐      │                  └─────────┘
-                                      │  │ Parser │─►│ Formatter │      │
-                                      │  └────────┘  └───────────┘      │
-                                      │  ┌───────────────────────────┐  │
-                                      │  │ HTTPS API (port 8443)     │  │
-                                      │  │  /api/v1/health           │  │
-                                      │  │  /api/v1/stats            │  │
-                                      │  │  /api/v1/translate        │  │
-                                      │  └───────────────────────────┘  │
+                                      │  │ Parser │─►│ Formatter │      │                       ▲
+                                      │  └────────┘  └───────────┘      │                       │
+                                      │         │                       │                       │
+                                      │         ▼                       │   ┌──────────────┐    │
+                                      │  ┌──────────────────┐           │   │   rsyslog     │    │
+                                      │  │ SyslogForwarder  │──logger──►│──►│   daemon      │────┘
+                                      │  └──────────────────┘           │   │ UDP/TCP/TLS   │
+                                      │  ┌───────────────────────────┐  │   └──────────────┘
+                                      │  │ HTTPS API (port 8443)     │  │  /etc/rsyslog.d/
+                                      │  └───────────────────────────┘  │  h3c-sgbox.conf
                                       └──────────────────────────────────┘
 ```
 
@@ -70,7 +73,7 @@ cd h3c-sgbox-translator
 # Automated install — sets up everything including TLS certs + CA bundle
 sudo bash install.sh
 
-# Edit config (set SGBox IP, API key, allowed IPs)
+# Edit config (set SGBox IP, allowed IPs)
 sudo nano /etc/h3c-translator/translator.config
 
 # Start the service
@@ -102,10 +105,12 @@ The translator uses a single INI config file at `/etc/h3c-translator/translator.
 
 ```ini
 [sgbox]
-mode = push              # push (TLS to SGBox) or pull (SGBox connects)
-host = 192.168.1.100     # SGBox SIEM server address
-port = 6154              # SGBox TLS syslog port
-protocol = tls           # tls, tcp, or udp
+mode = push                   # push (to SGBox) or pull (SGBox connects)
+host = 192.168.1.100          # SGBox SIEM server address (REQUIRED)
+port = 514                    # SGBox syslog port (514 for UDP/TCP, 6514 for TLS)
+protocol = udp                # udp (recommended), tcp, or tls
+forwarder_backend = rsyslog   # rsyslog (recommended) or python (legacy direct sockets)
+rsyslog_log_scope = all       # all (*.* — all logs) or auth (auth,authpriv.* only)
 
 [tls]
 cert_file = /etc/h3c-translator/certs/server.crt
@@ -117,7 +122,7 @@ allowed_ips = 10.16.18.0/24,10.13.0.0/24
 api_key = CHANGE_ME_GENERATE_A_SECURE_KEY
 ```
 
-> **TLS certificates are handled automatically.** The install script fetches Google Trust Services root CAs and merges them with the system CA bundle — no manual cert configuration needed.
+> **rsyslog forwarding is automatic.** The translator generates `/etc/rsyslog.d/h3c-sgbox.conf` and restarts rsyslog on startup — no manual syslog configuration needed. TLS certificates are also fetched automatically by the install script.
 
 See the [Configuration Reference](docs/Configuration.md) for all parameters.
 
@@ -153,7 +158,7 @@ h3c-sgbox-translator/
 ├── src/
 │   ├── translator.py          # Main entry point & orchestrator
 │   ├── syslog_receiver.py     # Async TLS/TCP syslog listener
-│   ├── syslog_forwarder.py    # Async TLS forwarder to SGBox (push mode)
+│   ├── syslog_forwarder.py    # Forwarder to SGBox (rsyslog default, python fallback)
 │   ├── syslog_output_server.py # TCP server for SGBox pull mode
 │   ├── parser.py              # H3C Comware log parser
 │   ├── formatter.py           # SGBox key-value formatter
@@ -184,6 +189,7 @@ Full documentation is available in the [`docs/`](docs/Home.md) directory:
 
 - **OS:** Debian 13 (Trixie) or compatible Linux
 - **Python:** 3.11+
+- **System:** `rsyslog` (installed automatically by `install.sh`)
 - **Dependencies:** `aiohttp`, `uvloop`, `structlog`, `tenacity`, `pyOpenSSL`, `python-gnupg`
 - **Network:** Ports 6514 (inbound), 6154 (outbound to SGBox), 8443 (API)
 

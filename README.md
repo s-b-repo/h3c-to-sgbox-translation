@@ -20,13 +20,15 @@ The H3C-SGBox Translator is a high-performance middleware service that bridges H
 | Feature | Description |
 |---------|-------------|
 | 📡 **rsyslog Forwarding** | Uses the system rsyslog daemon to forward translated logs to SGBox (default). Follows SGBox's official Debian syslog integration guide |
+| 🔀 **Parallel Transport** | New `parallel` backend sends via **both** rsyslog and direct UDP concurrently for maximum delivery reliability |
 | 🔒 **TLS Syslog Forwarding** | Supports TLS-encrypted push to SGBox with auto-fetched Google Trust Services + system CA bundle |
 | ⚡ **Fully Async** | Built on `asyncio` + `uvloop` for thousands of concurrent connections with minimal resource usage |
 | 🔑 **GPG Encryption** | Optional at-rest GPG encryption (AES256 symmetric or asymmetric) compatible with SGBox's scheme |
 | 🌐 **REST API** | HTTPS API for health checks, real-time stats, and ad-hoc log translation |
-| 🛡️ **Security Hardened** | IP whitelisting, API key auth, TLS 1.2+ enforcement, rate limiting, connection caps |
+| 🛡️ **Security Hardened** | IP whitelisting, API key auth, TLS 1.2+ enforcement, rate limiting, connection caps, rsyslog config injection prevention |
 | 🔄 **Auto-Reconnect** | Automatic fallback to Python direct sockets with tenacity exponential backoff |
-| 📦 **One-Command Install** | Automated `install.sh` with rsyslog, venv, systemd service, CA bundle fetch, and cert generation |
+| 😈 **Daemonize** | Runs as a proper Unix daemon via the `daemonize` pip package (PID file, log redirect, signal handling) |
+| 📦 **One-Command Install** | Automated `install.sh` with rsyslog, venv, CA bundle fetch, and cert generation |
 
 ## 🏗️ Architecture
 
@@ -76,9 +78,15 @@ sudo bash install.sh
 # Edit config (set SGBox IP, allowed IPs)
 sudo nano /etc/h3c-translator/translator.config
 
-# Start the service
-sudo systemctl start h3c-translator
-sudo systemctl status h3c-translator
+# Start as daemon
+/opt/h3c-sgbox-translator/venv/bin/python3 -m src.translator \
+    --config /etc/h3c-translator/translator.config --daemon
+
+# Check status
+cat /var/run/h3c-translator.pid && ps -p $(cat /var/run/h3c-translator.pid)
+
+# Stop
+kill $(cat /var/run/h3c-translator.pid)
 ```
 
 ### Local Development
@@ -109,7 +117,7 @@ mode = push                   # push (to SGBox) or pull (SGBox connects)
 host = 192.168.1.100          # SGBox SIEM server address (REQUIRED)
 port = 514                    # SGBox syslog port (514 for UDP/TCP, 6514 for TLS)
 protocol = udp                # udp (recommended), tcp, or tls
-forwarder_backend = rsyslog   # rsyslog (recommended) or python (legacy direct sockets)
+forwarder_backend = parallel  # parallel (rsyslog+UDP), rsyslog, or python (legacy)
 rsyslog_log_scope = all       # all (*.* — all logs) or auth (auth,authpriv.* only)
 
 [tls]
@@ -122,7 +130,9 @@ allowed_ips = 10.16.18.0/24,10.13.0.0/24
 api_key = CHANGE_ME_GENERATE_A_SECURE_KEY
 ```
 
-> **rsyslog forwarding is automatic.** The translator generates `/etc/rsyslog.d/h3c-sgbox.conf` and restarts rsyslog on startup — no manual syslog configuration needed. TLS certificates are also fetched automatically by the install script.
+> **rsyslog forwarding is automatic.** The translator generates `/etc/rsyslog.d/h3c-sgbox.conf` and restarts rsyslog on startup — no manual syslog configuration needed.
+>
+> **Parallel mode** sends via both rsyslog and direct UDP concurrently — if one vector fails, the other still delivers. Falls back to `python` (UDP-only) if rsyslog is not installed.
 
 See the [Configuration Reference](docs/Configuration.md) for all parameters.
 
@@ -148,7 +158,9 @@ curl -k -H "X-API-Key: <KEY>" https://localhost:8443/api/v1/health
 - **API key authentication** with timing-safe comparison
 - **Rate limiting** — 120 req/min per IP
 - **TLS compression disabled** (CRIME mitigation)
-- **Systemd hardening** — `NoNewPrivileges`, `PrivateTmp`, `ProtectSystem=full`
+- **rsyslog config injection prevention** — host values with `\n`, `\r`, null bytes are rejected
+- **Syslog message truncation** — oversized messages capped at 8192B before kernel limit
+- **PID file locking** — `fcntl.flock()` prevents duplicate daemon instances
 - **Async architecture** — immune to Slowloris and thread exhaustion attacks
 
 ## 📁 Project Structure
@@ -156,17 +168,16 @@ curl -k -H "X-API-Key: <KEY>" https://localhost:8443/api/v1/health
 ```
 h3c-sgbox-translator/
 ├── src/
-│   ├── translator.py          # Main entry point & orchestrator
-│   ├── syslog_receiver.py     # Async TLS/TCP syslog listener
-│   ├── syslog_forwarder.py    # Forwarder to SGBox (rsyslog default, python fallback)
+│   ├── translator.py          # Main entry point & orchestrator (daemonize via pip package)
+│   ├── syslog_receiver.py     # Async TLS/TCP/UDP syslog listener
+│   ├── syslog_forwarder.py    # Forwarder to SGBox (parallel/rsyslog/python backends)
 │   ├── syslog_output_server.py # TCP server for SGBox pull mode
 │   ├── parser.py              # H3C Comware log parser
-│   ├── formatter.py           # SGBox key-value formatter
+│   ├── formatter.py           # SGBox key-value & CEF formatter
 │   ├── encryption.py          # GPG encryption module
 │   └── api_server.py          # aiohttp REST API
 ├── docs/                      # Wiki documentation
-├── tests/                     # Test suite
-├── systemd/                   # Service file
+├── tests/                     # Test suite (139 tests)
 ├── translator.config          # Default configuration
 ├── install.sh                 # Automated installer
 ├── requirements.txt           # Python dependencies
@@ -189,9 +200,9 @@ Full documentation is available in the [`docs/`](docs/Home.md) directory:
 
 - **OS:** Debian 13 (Trixie) or compatible Linux
 - **Python:** 3.11+
-- **System:** `rsyslog` (installed automatically by `install.sh`)
-- **Dependencies:** `aiohttp`, `uvloop`, `structlog`, `tenacity`, `pyOpenSSL`, `python-gnupg`
-- **Network:** Ports 6514 (inbound), 6154 (outbound to SGBox), 8443 (API)
+- **System:** `rsyslog` (optional — installed automatically by `install.sh`, required for `rsyslog`/`parallel` backends)
+- **Dependencies:** `aiohttp`, `uvloop`, `structlog`, `tenacity`, `pyOpenSSL`, `python-gnupg`, `daemonize`
+- **Network:** Ports 6514 (inbound), 514 (outbound to SGBox), 8443 (API)
 
 ## 📄 License
 

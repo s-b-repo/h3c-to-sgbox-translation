@@ -153,9 +153,12 @@ class SyslogOutputServer:
             print(f"[OUTPUT] Collector {client_id} disconnected: {e}")
         finally:
             async with self._clients_lock:
-                self._clients.pop(client_id, None)
-            async with self._stats_lock:  # M4
-                self._stats["collectors_connected"] -= 1
+                # BUG-11: Only decrement if we actually removed this client
+                # (prevents negative counter if send() already removed it as dead)
+                was_present = self._clients.pop(client_id, None) is not None
+            if was_present:
+                async with self._stats_lock:  # M4
+                    self._stats["collectors_connected"] = max(0, self._stats["collectors_connected"] - 1)
             await self._safe_close_writer(writer)
             print(f"[OUTPUT] Collector {client_id} removed. Active: {self._stats['collectors_connected']}")
             logger.info("output.collector_disconnected", client_id=client_id)

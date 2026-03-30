@@ -29,7 +29,6 @@ from tenacity import (
     stop_after_attempt,
     wait_exponential,
     retry_if_exception_type,
-    before_sleep_log,
 )
 
 logger = structlog.get_logger(__name__)
@@ -108,14 +107,6 @@ class SyslogForwarder:
         self.severity = sgbox.get("severity", "info")
         self.backend = sgbox.get("forwarder_backend", "rsyslog").lower()
         self.rsyslog_log_scope = sgbox.get("rsyslog_log_scope", "all").lower()
-
-        # NOTE: SGBox syslog ingestion does NOT use API keys.
-        # API keys are only for SGBox REST API integrations.
-        _legacy_key = sgbox.get("sgbox_api_key", "").strip()
-        if _legacy_key and _legacy_key not in ("", "CHANGE_ME_SET_YOUR_SGBOX_API_KEY"):
-            print(f"[FORWARDER] ⚠ WARNING: sgbox_api_key is configured but NOT used")
-            print(f"[FORWARDER]   SGBox syslog (UDP/TCP/TLS) does not require API keys.")
-            print(f"[FORWARDER]   The API key config option has been removed.")
 
         self._tls_config = config.get("tls", {})
         self._reader: asyncio.StreamReader | None = None
@@ -475,14 +466,23 @@ class SyslogForwarder:
                 data = (message + "\n").encode("utf-8")
                 print(f"[FORWARDER] Sending via PARALLEL (rsyslog + UDP {len(data)}B)")
                 results = await asyncio.gather(
-                    self._send_rsyslog(message),
-                    self._send_udp(data),
+                    self._send_rsyslog(message, _parallel=True),
+                    self._send_udp(data, _parallel=True),
                     return_exceptions=True,
                 )
+                any_ok = False
                 for i, result in enumerate(results):
                     if isinstance(result, Exception):
                         vector = "rsyslog" if i == 0 else "udp"
                         print(f"[FORWARDER] ✗ Parallel vector {vector} failed: {result}")
+                    else:
+                        any_ok = True
+                # BUG-12: Count ONE logical message, not one per vector
+                async with self._stats_lock:
+                    if any_ok:
+                        self._stats["messages_sent"] += 1
+                    else:
+                        self._stats["messages_failed"] += 1
             case "python":
                 # Send as clean syslog — SGBox syslog ingestion does NOT use API keys
                 data = (message + "\n").encode("utf-8")
@@ -495,7 +495,7 @@ class SyslogForwarder:
 
     # ── rsyslog send ───────────────────────────────────────────────────
 
-    async def _send_rsyslog(self, message: str):
+    async def _send_rsyslog(self, message: str, _parallel: bool = False):
         """
         Send message directly to rsyslog via Python's syslog module.
 
@@ -504,6 +504,10 @@ class SyslogForwarder:
 
         B3: syslog.syslog() is a blocking C call, so we run it in the default
         executor to avoid stalling the event loop under high throughput.
+
+        Args:
+            _parallel: When True (called from parallel mode), skip aggregate
+                       messages_sent/messages_failed — the caller handles those.
         """
         # Open syslog connection if not already open
         if not self._syslog_opened:
@@ -528,20 +532,26 @@ class SyslogForwarder:
                 functools.partial(_syslog.syslog, self._syslog_severity, message),
             )
             async with self._stats_lock:
-                self._stats["messages_sent"] += 1
+                if not _parallel:
+                    self._stats["messages_sent"] += 1
                 self._stats["messages_sent_rsyslog"] += 1
             print(f"[FORWARDER] ✓ rsyslog message sent ({len(message)}B)")
         except Exception as e:
             async with self._stats_lock:
-                self._stats["messages_failed"] += 1
+                if not _parallel:
+                    self._stats["messages_failed"] += 1
                 self._stats["messages_failed_rsyslog"] += 1
             print(f"[FORWARDER] ✗ syslog send error: {e}")
             logger.error("forwarder.rsyslog_send_error", error=str(e))
 
     # ── python send (legacy) ───────────────────────────────────────────
 
-    async def _send_udp(self, data: bytes):
-        """Send message via async UDP transport."""
+    async def _send_udp(self, data: bytes, _parallel: bool = False):
+        """Send message via async UDP transport.
+
+        Args:
+            _parallel: When True, skip aggregate stats (caller handles them).
+        """
         try:
             if not self._transport or self._transport.is_closing():
                 print(f"[FORWARDER] UDP transport not ready, reconnecting...")
@@ -551,12 +561,14 @@ class SyslogForwarder:
             # do NOT pass addr to sendto(), it raises OSError on some OS.
             self._transport.sendto(data)
             async with self._stats_lock:
-                self._stats["messages_sent"] += 1
+                if not _parallel:
+                    self._stats["messages_sent"] += 1
                 self._stats["messages_sent_udp"] += 1
             print(f"[FORWARDER] ✓ UDP message sent ({len(data)}B)")
         except Exception as e:
             async with self._stats_lock:
-                self._stats["messages_failed"] += 1
+                if not _parallel:
+                    self._stats["messages_failed"] += 1
                 self._stats["messages_failed_udp"] += 1
             print(f"[FORWARDER] ✗ UDP send FAILED: {e}")
             logger.error("forwarder.udp_send_failed",

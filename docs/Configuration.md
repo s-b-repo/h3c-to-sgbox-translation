@@ -13,8 +13,8 @@ Controls how the translator binds to network interfaces for receiving H3C syslog
 | `api_port` | `8443` | Port for the HTTPS REST API |
 | `bind_address` | `0.0.0.0` | Interface to bind — `0.0.0.0` listens on all interfaces |
 | `max_connections` | `100` | Maximum concurrent syslog connections (enforced by asyncio semaphore) |
-| `daemonize` | `false` | Fork to background. Use `false` when running under systemd |
-| `pid_file` | `/var/run/h3c-translator.pid` | PID file location for daemon mode |
+| `daemonize` | `false` | Fork to background using pip `daemonize` package. Use `--daemon` CLI flag |
+| `pid_file` | `/var/run/h3c-translator.pid` | PID file location for daemon mode. Override with `--pid-file` |
 
 ## `[tls]`
 
@@ -53,12 +53,14 @@ Controls how translated logs are delivered to SGBox.
 | `tls_port` | `6514` | TLS syslog port (only used when `protocol = tls`) |
 | `output_port` | `1514` | TCP port SGBox collectors connect to (pull mode only) |
 | `protocol` | `udp` | Output protocol: `udp` (recommended), `tcp`, or `tls` |
-| `forwarder_backend` | `rsyslog` | **`rsyslog`** (recommended) — uses the system rsyslog daemon for forwarding. Generates `/etc/rsyslog.d/h3c-sgbox.conf` and restarts rsyslog automatically. **`python`** — legacy direct socket forwarding with built-in retry |
+| `forwarder_backend` | `rsyslog` | **`parallel`** (recommended) — sends via BOTH rsyslog and direct UDP concurrently for maximum reliability. **`rsyslog`** — uses the system rsyslog daemon only. **`python`** — legacy direct socket forwarding with built-in retry |
 | `rsyslog_log_scope` | `all` | Log scope when using rsyslog backend: **`all`** (`*.*` — all logs) or **`auth`** (`auth,authpriv.*` — authentication logs only) |
 | `facility` | `local0` | Syslog facility header (`local0`–`local7`, `user`, `daemon`, etc.) |
 | `severity` | `info` | Syslog severity header (`emerg`, `alert`, `crit`, `err`, `warning`, `notice`, `info`, `debug`) |
 
-> **rsyslog backend (default):** On startup, the translator writes `/etc/rsyslog.d/h3c-sgbox.conf` with the appropriate forwarding rule (e.g. `*.* @SGBox-IP` for UDP) and restarts the rsyslog daemon. Messages are sent via the `logger` command. If rsyslog is not installed, the translator falls back to the `python` backend automatically.
+> **parallel backend (recommended):** Sends via both rsyslog (`/dev/log`) and direct UDP simultaneously using `asyncio.gather`. If one vector fails, the other still delivers. Falls back to `python` if rsyslog is not installed. Per-vector stats are tracked separately.
+>
+> **rsyslog backend:** On startup, the translator writes `/etc/rsyslog.d/h3c-sgbox.conf` with the appropriate forwarding rule (e.g. `*.* @SGBox-IP` for UDP) and restarts the rsyslog daemon. Messages are sent via the Python `syslog` module. If rsyslog is not installed, the translator falls back to the `python` backend automatically.
 >
 > **python backend (legacy):** Opens direct UDP/TCP/TLS sockets from Python with tenacity exponential backoff retry. Does not require rsyslog.
 

@@ -14,17 +14,19 @@ This automatically:
 1. Installs system packages (`python3`, `openssl`, `curl`, `rsyslog`, `ca-certificates`, etc.)
 2. Creates the `h3c-translator` service user (no login shell)
 3. Creates directories (`/opt/h3c-sgbox-translator`, `/etc/h3c-translator`, `/var/log/h3c-translator`)
-4. Sets up a Python virtual environment with all pip dependencies
+4. Sets up a Python virtual environment with all pip dependencies (including `daemonize`)
 5. **Fetches Google Trust Services root CAs** from `https://pki.goog/roots.pem`
 6. **Merges with system CAs** into `/etc/h3c-translator/certs/ca-bundle.pem`
 7. Generates a self-signed TLS certificate for the inbound syslog listener
-8. Installs and enables the systemd service
 
-After `install.sh` completes, edit the config and start the service:
+After `install.sh` completes, edit the config and start the daemon:
 
 ```bash
 sudo nano /etc/h3c-translator/translator.config
-sudo systemctl start h3c-translator
+
+# Start as daemon
+/opt/h3c-sgbox-translator/venv/bin/python3 -m src.translator \
+    --config /etc/h3c-translator/translator.config --daemon
 ```
 
 ---
@@ -121,7 +123,8 @@ sudo nano /etc/h3c-translator/translator.config
 Essential settings:
 1. `[security]` → `api_key = <YOUR_GENERATED_KEY>`
 2. `[security]` → `allowed_ips = <YOUR_FIREWALL_AND_SGBOX_SUBNETS>`
-3. `[sgbox]` → `host = <SGBOX_IP>` and verify `port = 6154`, `protocol = tls`
+3. `[sgbox]` → `host = <SGBOX_IP>` and verify `port = 514`, `protocol = udp`
+4. `[sgbox]` → `forwarder_backend = parallel` (recommended — sends via rsyslog + UDP)
 
 Lock down permissions:
 ```bash
@@ -129,51 +132,50 @@ sudo chown root:h3c-translator /etc/h3c-translator/translator.config
 sudo chmod 640 /etc/h3c-translator/translator.config
 ```
 
-### 9. Setup Systemd Service
+### 9. Start as Daemon
+
+The translator uses the pip `daemonize` package for proper Unix daemon management. No systemd service file is needed.
 
 ```bash
-sudo cp systemd/h3c-translator.service /lib/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable h3c-translator
+# Start the daemon
+/opt/h3c-sgbox-translator/venv/bin/python3 -m src.translator \
+    --config /etc/h3c-translator/translator.config --daemon
+
+# Or with custom PID/log files
+/opt/h3c-sgbox-translator/venv/bin/python3 -m src.translator \
+    --config /etc/h3c-translator/translator.config --daemon \
+    --pid-file /var/run/h3c.pid --log-file /var/log/h3c-translator/daemon.log
 ```
 
-**Service file** (`h3c-translator.service`):
-```ini
-[Unit]
-Description=H3C to SGBox Log Translator Service (v2.0.0)
-After=network.target
+Daemon management commands:
+```bash
+# Check if running
+cat /var/run/h3c-translator.pid && ps -p $(cat /var/run/h3c-translator.pid)
 
-[Service]
-Type=simple
-User=h3c-translator
-Group=h3c-translator
-ExecStart=/opt/h3c-sgbox-translator/venv/bin/python3 -m src.translator \
-    --config /etc/h3c-translator/translator.config
-WorkingDirectory=/opt/h3c-sgbox-translator
-Restart=always
-RestartSec=5
+# Stop the daemon
+kill $(cat /var/run/h3c-translator.pid)
 
-# Security hardening
-NoNewPrivileges=yes
-PrivateTmp=yes
-ProtectSystem=full
-ProtectHome=yes
+# Force stop
+kill -9 $(cat /var/run/h3c-translator.pid)
 
-[Install]
-WantedBy=multi-user.target
+# View logs
+tail -f /var/log/h3c-translator/translator.log
 ```
 
-### 10. Start & Verify
+> **Tip:** To run on boot without systemd, add this to `/etc/rc.local` or create a cron `@reboot` entry:
+> ```
+> @reboot /opt/h3c-sgbox-translator/venv/bin/python3 -m src.translator --config /etc/h3c-translator/translator.config --daemon
+> ```
+
+### 10. Verify
 
 ```bash
-sudo systemctl start h3c-translator
-sudo systemctl status h3c-translator
-sudo journalctl -u h3c-translator -f
+tail -f /var/log/h3c-translator/translator.log
 ```
 
 You should see:
 - `receiver.tls_started port=6514`
-- `forwarder.backend=rsyslog`
+- `forwarder.backend=parallel` (or `rsyslog`)
 - `forwarder.rsyslog_config_written path=/etc/rsyslog.d/h3c-sgbox.conf`
 - `translator.running output_mode=push`
 

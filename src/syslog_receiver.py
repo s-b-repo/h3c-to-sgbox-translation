@@ -16,7 +16,7 @@ import ipaddress
 import ssl
 
 import structlog
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, Optional, Set
 
 logger = structlog.get_logger(__name__)
 

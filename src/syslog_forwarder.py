@@ -4,18 +4,21 @@ Async Syslog Forwarder
 Forwards translated log messages to the SGBox SIEM server via:
   - rsyslog backend (DEFAULT) — writes to local rsyslog, which handles delivery
   - python backend (LEGACY)  — direct UDP/TCP/TLS sockets from Python
+  - parallel backend          — sends via BOTH rsyslog AND direct UDP concurrently
 
 The rsyslog backend follows the SGBox Debian integration guide:
   1. Install rsyslog:  apt-get -y install rsyslog
   2. Generate /etc/rsyslog.d/h3c-sgbox.conf with forwarding rule
   3. Restart rsyslog daemon
-  4. Send messages via `logger` command
+  4. Send messages via Python syslog module
 
 Dependencies: structlog, tenacity
 """
 
 import asyncio
+import functools
 import os
+import re
 import shutil
 import ssl
 import syslog as _syslog
@@ -34,6 +37,12 @@ logger = structlog.get_logger(__name__)
 # rsyslog drop-in config path
 RSYSLOG_CONF_DIR = "/etc/rsyslog.d"
 RSYSLOG_CONF_FILE = os.path.join(RSYSLOG_CONF_DIR, "h3c-sgbox.conf")
+
+# S4: Maximum syslog message size (bytes) — kernel /dev/log limit
+MAX_SYSLOG_MSG = 8192
+
+# S1: Regex to detect rsyslog config injection attempts in host values
+_UNSAFE_HOST_RE = re.compile(r'[\n\r\x00]')
 
 # Syslog facility codes (from syslog module)
 FACILITY_MAP = {
@@ -61,14 +70,17 @@ class SyslogForwarder:
     """
     Async syslog forwarder to SGBox.
 
-    Supports two backends:
+    Supports three backends:
         - rsyslog (default): Configures system rsyslog to forward to SGBox,
-          sends messages via `logger` command. Recommended for Debian/SGBox.
+          sends messages via Python syslog module. Recommended for Debian/SGBox.
         - python (legacy): Direct async UDP/TCP/TLS sockets with tenacity retry.
+        - parallel: Sends via BOTH rsyslog AND direct UDP concurrently for
+          maximum delivery reliability.
 
     Features:
         - Automatic rsyslog configuration generation and deployment
         - Fallback to direct Python sockets when rsyslog is unavailable
+        - Parallel multi-vector delivery (UDP + rsyslog)
         - Message queueing and retry (python backend)
         - Connection health monitoring
     """
@@ -80,6 +92,16 @@ class SyslogForwarder:
             print(f"[FORWARDER] ✗ FATAL: No SGBox host configured in [sgbox] section")
             print(f"[FORWARDER]   Set 'host = <SGBox-IP>' in translator.config")
             raise ValueError("SGBox host not configured — set 'host' in [sgbox] config section")
+
+        # S1: Reject host values containing newlines/control chars (rsyslog config injection)
+        if _UNSAFE_HOST_RE.search(self.host):
+            print(f"[FORWARDER] ✗ FATAL: Host contains unsafe characters (newline/control)")
+            print(f"[FORWARDER]   This could inject arbitrary rsyslog directives.")
+            raise ValueError(
+                "SGBox host contains unsafe characters (newline/null) — "
+                "possible rsyslog config injection attempt"
+            )
+
         self.port = int(sgbox.get("port", 514))
         self.protocol = sgbox.get("protocol", "udp").lower()
         self.facility = sgbox.get("facility", "local0")
@@ -106,6 +128,10 @@ class SyslogForwarder:
             "messages_sent": 0,
             "messages_failed": 0,
             "reconnections": 0,
+            "messages_sent_rsyslog": 0,
+            "messages_sent_udp": 0,
+            "messages_failed_rsyslog": 0,
+            "messages_failed_udp": 0,
         }
         # MED-04: Lock for thread-safe stats updates
         self._stats_lock = asyncio.Lock()
@@ -123,6 +149,13 @@ class SyslogForwarder:
                     print(f"[FORWARDER] ⚠ rsyslogd not found on PATH — falling back to python backend")
                     print(f"[FORWARDER]   Install rsyslog: apt-get -y install rsyslog")
                     self.backend = "python"
+            case "parallel":
+                # Parallel mode: rsyslog + direct UDP simultaneously
+                if not shutil.which("rsyslogd"):
+                    print(f"[FORWARDER] ⚠ rsyslogd not found for parallel mode — falling back to python")
+                    self.backend = "python"
+                else:
+                    print(f"[FORWARDER] ✓ Parallel mode: rsyslog + direct UDP")
             case "python":
                 pass  # Legacy mode, no extra checks
             case _:
@@ -135,7 +168,7 @@ class SyslogForwarder:
         print(f"[FORWARDER]   Target:       {self.host}:{self.port}")
         print(f"[FORWARDER]   Facility:     {self.facility}")
         print(f"[FORWARDER]   Severity:     {self.severity}")
-        if self.backend == "rsyslog":
+        if self.backend in ("rsyslog", "parallel"):
             print(f"[FORWARDER]   Log scope:    {self.rsyslog_log_scope}")
 
     @property
@@ -153,6 +186,12 @@ class SyslogForwarder:
         match self.backend:
             case "rsyslog":
                 await self._setup_rsyslog()
+            case "parallel":
+                # Set up BOTH rsyslog and direct UDP simultaneously
+                print(f"[FORWARDER] Parallel mode: setting up rsyslog + direct UDP...")
+                await self._setup_rsyslog()
+                await self._connect_udp()
+                print(f"[FORWARDER] ✓ Parallel vectors ready (rsyslog + UDP)")
             case "python":
                 await self._connect_python()
 
@@ -421,7 +460,8 @@ class SyslogForwarder:
         """
         Send a single syslog message to SGBox (async).
 
-        Dispatches to rsyslog (via logger command) or python backend.
+        Dispatches to rsyslog, python, or parallel backend.
+        In parallel mode, fires rsyslog + direct UDP concurrently.
         """
         if not message:
             print(f"[FORWARDER] ✗ Empty message, skipping")
@@ -430,6 +470,19 @@ class SyslogForwarder:
         match self.backend:
             case "rsyslog":
                 await self._send_rsyslog(message)
+            case "parallel":
+                # Fire BOTH vectors concurrently — one failure doesn't block the other
+                data = (message + "\n").encode("utf-8")
+                print(f"[FORWARDER] Sending via PARALLEL (rsyslog + UDP {len(data)}B)")
+                results = await asyncio.gather(
+                    self._send_rsyslog(message),
+                    self._send_udp(data),
+                    return_exceptions=True,
+                )
+                for i, result in enumerate(results):
+                    if isinstance(result, Exception):
+                        vector = "rsyslog" if i == 0 else "udp"
+                        print(f"[FORWARDER] ✗ Parallel vector {vector} failed: {result}")
             case "python":
                 # Send as clean syslog — SGBox syslog ingestion does NOT use API keys
                 data = (message + "\n").encode("utf-8")
@@ -448,6 +501,9 @@ class SyslogForwarder:
 
         Writes to /dev/log (Unix domain socket) — zero subprocess overhead.
         rsyslog then forwards to SGBox per /etc/rsyslog.d/h3c-sgbox.conf.
+
+        B3: syslog.syslog() is a blocking C call, so we run it in the default
+        executor to avoid stalling the event loop under high throughput.
         """
         # Open syslog connection if not already open
         if not self._syslog_opened:
@@ -459,15 +515,26 @@ class SyslogForwarder:
             self._syslog_opened = True
             print(f"[FORWARDER] ✓ syslog socket opened (facility={self.facility})")
 
+        # S4: Truncate oversized messages to kernel syslog limit
+        if len(message.encode("utf-8", errors="replace")) > MAX_SYSLOG_MSG:
+            message = message[:MAX_SYSLOG_MSG].rstrip()
+            print(f"[FORWARDER] ⚠ Message truncated to {MAX_SYSLOG_MSG}B for syslog")
+
         try:
-            # syslog.syslog() writes directly to /dev/log — picked up by rsyslog
-            _syslog.syslog(self._syslog_severity, message)
+            # B3: Run blocking syslog.syslog() in executor to avoid stalling event loop
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                functools.partial(_syslog.syslog, self._syslog_severity, message),
+            )
             async with self._stats_lock:
                 self._stats["messages_sent"] += 1
+                self._stats["messages_sent_rsyslog"] += 1
             print(f"[FORWARDER] ✓ rsyslog message sent ({len(message)}B)")
         except Exception as e:
             async with self._stats_lock:
                 self._stats["messages_failed"] += 1
+                self._stats["messages_failed_rsyslog"] += 1
             print(f"[FORWARDER] ✗ syslog send error: {e}")
             logger.error("forwarder.rsyslog_send_error", error=str(e))
 
@@ -480,13 +547,17 @@ class SyslogForwarder:
                 print(f"[FORWARDER] UDP transport not ready, reconnecting...")
                 await self._connect_udp()
 
-            self._transport.sendto(data, (self.host, self.port))  # H5: explicit target
+            # B1: Connected UDP endpoint (remote_addr set at creation) —
+            # do NOT pass addr to sendto(), it raises OSError on some OS.
+            self._transport.sendto(data)
             async with self._stats_lock:
                 self._stats["messages_sent"] += 1
+                self._stats["messages_sent_udp"] += 1
             print(f"[FORWARDER] ✓ UDP message sent ({len(data)}B)")
         except Exception as e:
             async with self._stats_lock:
                 self._stats["messages_failed"] += 1
+                self._stats["messages_failed_udp"] += 1
             print(f"[FORWARDER] ✗ UDP send FAILED: {e}")
             logger.error("forwarder.udp_send_failed",
                           host=self.host, port=self.port, error=str(e))
@@ -530,7 +601,9 @@ class SyslogForwarder:
                     await self._writer.drain()
                     async with self._stats_lock:  # H4: consistent locking
                         self._stats["messages_sent"] += 1
-                        self._stats["messages_failed"] -= 1
+                        # B7: Only decrement if positive to prevent negative counters
+                        if self._stats["messages_failed"] > 0:
+                            self._stats["messages_failed"] -= 1
                         self._stats["reconnections"] += 1
                     print(f"[FORWARDER] ✓ Reconnected and resent successfully")
                 except Exception as e2:
@@ -604,7 +677,18 @@ class SyslogForwarder:
                     # rsyslog keeps running — we don't remove the config
                     # so forwarding continues even after translator stops
                     print(f"[FORWARDER] rsyslog backend — config persists at {RSYSLOG_CONF_FILE}")
-                    print(f"[FORWARDER]   To stop forwarding: rm {RSYSLOG_CONF_FILE} && systemctl restart rsyslog")
+                    print(f"[FORWARDER]   To stop forwarding: rm {RSYSLOG_CONF_FILE} && service rsyslog restart")
+                case "parallel":
+                    # Close BOTH vectors
+                    if self._syslog_opened:
+                        _syslog.closelog()
+                        self._syslog_opened = False
+                    if self._transport:
+                        self._transport.close()
+                        self._transport = None
+                    print(f"[FORWARDER] Parallel backend closed (rsyslog + UDP)")
+                    print(f"[FORWARDER]   rsyslog config persists at {RSYSLOG_CONF_FILE}")
+                    print(f"[FORWARDER]   To stop forwarding: rm {RSYSLOG_CONF_FILE} && service rsyslog restart")
                 case "python":
                     if self._transport:
                         self._transport.close()

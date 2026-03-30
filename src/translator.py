@@ -6,7 +6,7 @@ Orchestrates all components:
   2. Starts TLS syslog receiver (async, multi-connection)
   3. Starts syslog forwarder to SGBox (async)
   4. Starts aiohttp REST API (async)
-  5. Runs as background daemon (optional)
+  5. Runs as background daemon (via pip daemonize package)
 
 Usage:
     # Foreground mode:
@@ -18,13 +18,13 @@ Usage:
     # CLI mode (translate CSV file):
     python3 -m src.translator --config translator.config --input logs.csv --output translated.log
 
-Dependencies: uvloop, structlog, aiohttp, tenacity, pyOpenSSL
+Dependencies: uvloop, structlog, aiohttp, tenacity, pyOpenSSL, daemonize
 """
 
 import argparse
 import asyncio
-import atexit
 import configparser
+import logging
 import os
 import signal
 import sys
@@ -32,6 +32,7 @@ from typing import Dict
 
 import structlog
 import uvloop
+from daemonize import Daemonize
 
 from .parser import H3CLogParser
 from .formatter import SGBoxFormatter
@@ -164,66 +165,27 @@ def load_config(config_path: str) -> Dict[str, dict]:
     return config
 
 
-def daemonize(pid_file: str):
+def _build_daemon_logger(log_file: str) -> logging.Logger:
     """
-    Double-fork daemonize process (Unix only).
+    Build a stdlib logger for the daemonize package.
 
-    Writes PID to pid_file for systemd/init management.
+    Logs to file (not /dev/null) so daemon output survives.
     """
-    print(f"[DAEMON] Daemonizing process...")
+    daemon_logger = logging.getLogger("h3c-daemon")
+    daemon_logger.setLevel(logging.DEBUG)
 
-    # First fork
-    try:
-        pid = os.fork()
-        if pid > 0:
-            print(f"[DAEMON] First fork — parent exiting (child PID: {pid})")
-            sys.exit(0)
-    except OSError as e:
-        print(f"[DAEMON] ✗ First fork FAILED: {e}")
-        logger.error("daemon.first_fork_failed", error=str(e))
-        sys.exit(1)
+    # Log file handler — daemon output goes here
+    log_dir = os.path.dirname(log_file)
+    if log_dir and not os.path.exists(log_dir):
+        os.makedirs(log_dir, exist_ok=True)
 
-    os.chdir("/")
-    os.setsid()
-    os.umask(0o027)
-
-    # Second fork
-    try:
-        pid = os.fork()
-        if pid > 0:
-            print(f"[DAEMON] Second fork — intermediate exiting (daemon PID: {pid})")
-            sys.exit(0)
-    except OSError as e:
-        print(f"[DAEMON] ✗ Second fork FAILED: {e}")
-        logger.error("daemon.second_fork_failed", error=str(e))
-        sys.exit(1)
-
-    # Redirect stdio
-    sys.stdout.flush()
-    sys.stderr.flush()
-
-    devnull_fd = os.open(os.devnull, os.O_RDWR)
-    os.dup2(devnull_fd, sys.stdin.fileno())
-    os.dup2(devnull_fd, sys.stdout.fileno())
-    os.dup2(devnull_fd, sys.stderr.fileno())
-    os.close(devnull_fd)
-
-    # Write PID file
-    pid = os.getpid()
-    pid_dir = os.path.dirname(pid_file)
-    if pid_dir and not os.path.exists(pid_dir):
-        os.makedirs(pid_dir, exist_ok=True)
-    with open(pid_file, "w") as f:
-        f.write(str(pid))
-
-    def _cleanup_pid():
-        try:
-            os.remove(pid_file)
-        except OSError:
-            pass
-    atexit.register(_cleanup_pid)
-
-    logger.info("daemon.started", pid=pid, pid_file=pid_file)
+    fh = logging.FileHandler(log_file)
+    fh.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+    daemon_logger.addHandler(fh)
+    return daemon_logger
 
 
 def run_cli_mode(config: dict, input_path: str, output_path: str):
@@ -498,7 +460,7 @@ async def run_server(config: dict):
                 dest_config["sgbox"] = dest_sgbox
                 fwd = SyslogForwarder(dest_config)
                 forwarders.append(fwd)
-                print(f"[SERVER] ✓ Forwarder created for {host}:{dest_sgbox.get('port', '6154')}")
+                print(f"[SERVER] ✓ Forwarder created for {host}:{dest_sgbox.get('port', '514')}")
 
             print(f"[SERVER] {len(forwarders)} push destination(s) configured")
         case "pull":
@@ -663,8 +625,9 @@ async def run_server(config: dict):
     # ── Cleanup ────────────────────────────────────────────────────
     print(f"\n[SERVER] Shutting down...")
     logger.info("translator.shutting_down")
-    # Flush remaining failed log buffer
-    parser.flush_remaining()
+    # Flush remaining failed log buffer (if method exists)
+    if hasattr(parser, 'flush_remaining'):
+        parser.flush_remaining()
     await receiver.stop()
     await api.stop()
     if output_server:
@@ -703,6 +666,10 @@ Examples:
   # Run as daemon (background):
   python3 -m src.translator --config translator.config --daemon
 
+  # Custom PID / log files:
+  python3 -m src.translator --config translator.config --daemon \\
+      --pid-file /var/run/h3c.pid --log-file /var/log/h3c-translator/daemon.log
+
   # Translate a CSV file:
   python3 -m src.translator --config translator.config \\
       --input Raw_logs.csv --output translated.log
@@ -720,7 +687,17 @@ Examples:
     arg_parser.add_argument(
         "--daemon", "-d",
         action="store_true",
-        help="Run as background daemon",
+        help="Run as background daemon (uses pip daemonize package)",
+    )
+    arg_parser.add_argument(
+        "--pid-file",
+        default=None,
+        help="PID file path for daemon mode (default: /var/run/h3c-translator.pid)",
+    )
+    arg_parser.add_argument(
+        "--log-file",
+        default=None,
+        help="Log file for daemon output (default: /var/log/h3c-translator/translator.log)",
     )
     arg_parser.add_argument(
         "--input", "-i",
@@ -751,13 +728,39 @@ Examples:
         run_cli_mode(config, args.input, output)
         return
 
-    # Daemon mode
+    # Daemon mode — use pip daemonize package for proper process management
     if args.daemon:
-        pid_file = config.get("server", {}).get(
+        pid_file = args.pid_file or config.get("server", {}).get(
             "pid_file", "/var/run/h3c-translator.pid"
         )
-        print(f"[MAIN] Running in daemon mode (PID file: {pid_file})")
-        daemonize(pid_file)
+        log_file = args.log_file or config.get("logging", {}).get(
+            "file", "/var/log/h3c-translator/translator.log"
+        )
+
+        print(f"[MAIN] Running in daemon mode (pip daemonize)")
+        print(f"[MAIN]   PID file: {pid_file}")
+        print(f"[MAIN]   Log file: {log_file}")
+
+        daemon_logger = _build_daemon_logger(log_file)
+
+        # Keep the log file FD open across the double-fork
+        keep_fds = [h.stream.fileno() for h in daemon_logger.handlers
+                     if hasattr(h, 'stream') and hasattr(h.stream, 'fileno')]
+
+        def _daemon_action():
+            """Action executed after daemonize forks."""
+            daemon_logger.info("Daemon started, PID=%d", os.getpid())
+            uvloop.run(run_server(config))
+
+        daemon = Daemonize(
+            app="h3c-translator",
+            pid=pid_file,
+            action=_daemon_action,
+            keep_fds=keep_fds,
+            logger=daemon_logger,
+            verbose=True,
+        )
+        daemon.start()  # Does not return — runs _daemon_action in forked child
     else:
         print(f"[MAIN] Running in foreground mode")
 

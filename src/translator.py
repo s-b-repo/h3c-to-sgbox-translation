@@ -453,14 +453,14 @@ async def run_server(config: dict):
                 hosts = ["127.0.0.1"]
 
             for host in hosts:
-                # Create per-destination config override
-                dest_config = dict(config)
-                dest_sgbox = dict(sgbox_config)
-                dest_sgbox["host"] = host
-                dest_config["sgbox"] = dest_sgbox
+                # BUG-10: deep copy so each forwarder gets an isolated config
+                # (shallow dict() shares nested dicts like [tls], [server])
+                import copy
+                dest_config = copy.deepcopy(config)
+                dest_config["sgbox"]["host"] = host
                 fwd = SyslogForwarder(dest_config)
                 forwarders.append(fwd)
-                print(f"[SERVER] ✓ Forwarder created for {host}:{dest_sgbox.get('port', '514')}")
+                print(f"[SERVER] ✓ Forwarder created for {host}:{dest_config['sgbox'].get('port', '514')}")
 
             print(f"[SERVER] {len(forwarders)} push destination(s) configured")
         case "pull":
@@ -748,8 +748,26 @@ Examples:
                      if hasattr(h, 'stream') and hasattr(h.stream, 'fileno')]
 
         def _daemon_action():
-            """Action executed after daemonize forks."""
+            """Action executed after daemonize forks.
+
+            After the double-fork, stdout/stderr are closed. We must:
+              1. Redirect stdout/stderr to the log file so print() works
+              2. Re-initialize structlog (parent's config doesn't survive fork)
+              3. Start the async event loop
+            """
+            # Redirect stdout/stderr to the daemon log file so all print()
+            # calls throughout the codebase work instead of crashing silently
+            log_fd = open(log_file, "a", buffering=1)  # line-buffered
+            os.dup2(log_fd.fileno(), sys.stdout.fileno())
+            os.dup2(log_fd.fileno(), sys.stderr.fileno())
+            sys.stdout = log_fd
+            sys.stderr = log_fd
+
             daemon_logger.info("Daemon started, PID=%d", os.getpid())
+
+            # Re-initialize structlog inside the daemon process
+            setup_structlog(config)
+
             uvloop.run(run_server(config))
 
         daemon = Daemonize(
@@ -757,8 +775,10 @@ Examples:
             pid=pid_file,
             action=_daemon_action,
             keep_fds=keep_fds,
+            auto_close_fds=False,   # CRITICAL: don't close asyncio's epoll/signal FDs
             logger=daemon_logger,
             verbose=True,
+            chdir="/",
         )
         daemon.start()  # Does not return — runs _daemon_action in forked child
     else:

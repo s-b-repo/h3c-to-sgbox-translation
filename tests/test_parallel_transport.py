@@ -81,7 +81,7 @@ class TestParallelSend(unittest.TestCase):
         finally:
             loop.close()
 
-        fwd._send_rsyslog.assert_called_once_with("test message")
+        fwd._send_rsyslog.assert_called_once_with("test message", _parallel=True)
         fwd._send_udp.assert_called_once()
 
     @patch("shutil.which")

@@ -509,7 +509,7 @@ class APIServer:
             match parsed:
                 case None:
                     results.append({
-                        "input": line[:100],
+                        "index": i,
                         "translated": None,
                         "error": "unparsable",
                     })
@@ -517,7 +517,7 @@ class APIServer:
                 case _:
                     formatted = self.formatter.format(parsed)
                     results.append({
-                        "input": line[:100],
+                        "index": i,
                         "translated": formatted,
                     })
                     print(f"[API] Bulk [{i+1}/{len(lines)}] ✓ translated")

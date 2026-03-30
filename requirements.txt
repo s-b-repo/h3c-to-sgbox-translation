@@ -20,3 +20,6 @@ python-gnupg>=0.5.4
 
 # Enhanced TLS/SSL support (optional, for advanced cert inspection)
 pyOpenSSL>=25.0
+
+# Unix daemon process management (PID file, double-fork, signal handling)
+daemonize>=2.5

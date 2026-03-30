@@ -231,18 +231,11 @@ else
     fi
 fi
 
-# ── Install systemd service ───────────────────────────────────────
+# ── Daemon management (replaces systemd) ──────────────────────────
 echo ""
-if [ -f "${SCRIPT_DIR}/systemd/h3c-translator.service" ]; then
-    echo "[*] Installing systemd service..."
-    cp "${SCRIPT_DIR}/systemd/h3c-translator.service" /lib/systemd/system/
-    systemctl daemon-reload
-    systemctl enable h3c-translator.service
-    echo "    ✓ Service installed and enabled"
-else
-    echo "[*] systemd service file not found, skipping"
-    echo "    Expected: ${SCRIPT_DIR}/systemd/h3c-translator.service"
-fi
+echo "[*] Daemon management uses the pip 'daemonize' package."
+echo "    The --daemon flag handles PID file, double-fork, and log redirect."
+echo "    ✓ No systemd service file needed"
 
 # ── Set permissions ────────────────────────────────────────────────
 echo ""
@@ -263,7 +256,6 @@ echo "  Config:  ${CONFIG_DIR}/translator.config"
 echo "  Certs:   ${CERT_DIR}/"
 echo "  Logs:    ${LOG_DIR}/"
 echo "  Venv:    ${INSTALL_DIR}/venv/"
-echo "  Service: systemctl start h3c-translator"
 echo ""
 echo "  ⚠  NEXT STEPS:"
 echo "     1. Edit the config:"
@@ -271,10 +263,15 @@ echo "        nano ${CONFIG_DIR}/translator.config"
 echo ""
 echo "     2. Set your SGBox host/port and allowed_ips"
 echo ""
-echo "     3. Start the service:"
-echo "        systemctl start h3c-translator"
-echo "        systemctl status h3c-translator"
+echo "     3. Start the translator daemon:"
+echo "        ${VENV_PYTHON} -m src.translator --config ${CONFIG_DIR}/translator.config --daemon"
 echo ""
-echo "     4. Check logs:"
-echo "        journalctl -u h3c-translator -f"
+echo "     4. Stop the daemon:"
+echo "        kill \$(cat /var/run/h3c-translator.pid)"
+echo ""
+echo "     5. Check daemon status:"
+echo "        cat /var/run/h3c-translator.pid && ps -p \$(cat /var/run/h3c-translator.pid)"
+echo ""
+echo "     6. Check logs:"
+echo "        tail -f ${LOG_DIR}/translator.log"
 echo ""
